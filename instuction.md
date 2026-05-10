@@ -33,22 +33,22 @@ src-tauri/resources/localinstall.apk
 Пусть APK лежит на компьютере:
 
 ```text
-/path/to/app.apk
+app.apk
 ```
 
 Пусть helper лежит:
 
 ```text
-/Users/dngulyachenkov/Documents/cheryapkinstall/src-tauri/resources/localinstall.apk
+src-tauri/resources/localinstall.apk
 ```
 
 Установка:
 
 ```bash
-adb push /path/to/app.apk /data/local/tmp/desaysv-install-target.apk
+adb push app.apk /data/local/tmp/desaysv-install-target.apk
 adb shell chmod 644 /data/local/tmp/desaysv-install-target.apk
 
-adb push /Users/dngulyachenkov/Documents/cheryapkinstall/src-tauri/resources/localinstall.apk /data/local/tmp/desaysv-localinstall.apk
+adb push src-tauri/resources/localinstall.apk /data/local/tmp/desaysv-localinstall.apk
 adb shell chmod 644 /data/local/tmp/desaysv-localinstall.apk
 
 adb shell 'CLASSPATH=/data/local/tmp/desaysv-localinstall.apk /system/bin/app_process /system/bin LocalInstall /data/local/tmp/desaysv-install-target.apk'
@@ -63,7 +63,7 @@ adb shell pm list packages | grep '<package.name>'
 Если имя пакета неизвестно, его можно определить до установки через `aapt`/`aapt2`:
 
 ```bash
-aapt dump badging /path/to/app.apk | sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p"
+aapt dump badging app.apk | sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p"
 ```
 
 Или после установки сравнить список пакетов до и после:
@@ -169,4 +169,3 @@ session.close();
 `PendingIntent` не использовать: shell-процесс получает system context с package `android`, но uid
 остается shell, и Android запрещает создавать PendingIntent от имени `android`. Поэтому используется
 собственный `IntentSender` через `IIntentSender.Stub`.
-

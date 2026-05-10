@@ -15,7 +15,7 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
 ## Что находится в папке
 
 ```text
-/Users/dngulyachenkov/Documents/cheryapkinstall
+.
   README.md                    запуск, сборка и использование приложения
   Makefile                     команды для разработки и сборки
   instuction.md                полный алгоритм установки APK на ГУ для другой LLM
@@ -42,7 +42,7 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
 ## Разработка и запуск из исходников
 
 ```bash
-cd /Users/dngulyachenkov/Documents/cheryapkinstall
+cd cheryapkinstall
 make install-deps
 make dev
 ```
@@ -50,7 +50,7 @@ make dev
 ## Сборка
 
 ```bash
-cd /Users/dngulyachenkov/Documents/cheryapkinstall
+cd cheryapkinstall
 make build
 ```
 
@@ -89,7 +89,7 @@ brew install node rust
 Команды:
 
 ```bash
-cd /Users/dngulyachenkov/Documents/cheryapkinstall
+cd cheryapkinstall
 make install-deps
 make dev
 make build
@@ -137,7 +137,7 @@ sudo apt install -y \
   libssl-dev \
   libwebkit2gtk-4.1-dev
 
-cd /path/to/cheryapkinstall
+cd cheryapkinstall
 npm install
 npm run tauri dev
 npm run tauri build
@@ -169,5 +169,5 @@ adb shell appops get <package.name>
 Полное техническое описание находится в:
 
 ```text
-/Users/dngulyachenkov/Documents/cheryapkinstall/instuction.md
+instuction.md
 ```

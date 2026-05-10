@@ -2,7 +2,7 @@
 name = "desaysv-apk-installer"
 version = "1.0.0"
 description = "APK installer for DesaySV Android head units"
-authors = ["dngulyachenkov"]
+authors = ["EvilBorsch"]
 edition = "2021"
 
 [lib]
