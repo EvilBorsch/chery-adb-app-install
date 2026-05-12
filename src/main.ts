@@ -28,6 +28,8 @@ if (!app) {
 }
 
 let selectedApk: string | null = null;
+let selectedPackage: string | null = null;
+let uninstallablePackages: string[] = [];
 let busy = false;
 let steps: Step[] = [];
 let device: DeviceInfo | null = null;
@@ -59,7 +61,21 @@ app.innerHTML = `
     </section>
 
     <section class="actions">
-      <button id="installApk" class="primary" type="button" disabled>Установить APK и выдать разрешения</button>
+      <button id="installNormalApk" class="primary" type="button" disabled>Установить обычное приложение</button>
+      <button id="installCarApk" class="danger" type="button" disabled>Установить приложение с правом управления авто (вам это скорее всего не надо)</button>
+    </section>
+
+    <section class="app-manager">
+      <div class="app-manager-header">
+        <h2>Удаление приложения</h2>
+        <button id="loadApps" type="button">Обновить список</button>
+      </div>
+      <div class="app-manager-controls">
+        <select id="packageSelect" aria-label="Выбор приложения">
+          <option value="">Список не загружен</option>
+        </select>
+        <button id="uninstallApp" class="danger" type="button" disabled>Удалить выбранное</button>
+      </div>
     </section>
 
     <section class="log-panel">
@@ -72,7 +88,11 @@ app.innerHTML = `
 const installDepsButton = document.querySelector<HTMLButtonElement>("#installDeps")!;
 const checkDeviceButton = document.querySelector<HTMLButtonElement>("#checkDevice")!;
 const pickApkButton = document.querySelector<HTMLButtonElement>("#pickApk")!;
-const installApkButton = document.querySelector<HTMLButtonElement>("#installApk")!;
+const installNormalApkButton = document.querySelector<HTMLButtonElement>("#installNormalApk")!;
+const installCarApkButton = document.querySelector<HTMLButtonElement>("#installCarApk")!;
+const loadAppsButton = document.querySelector<HTMLButtonElement>("#loadApps")!;
+const uninstallAppButton = document.querySelector<HTMLButtonElement>("#uninstallApp")!;
+const packageSelect = document.querySelector<HTMLSelectElement>("#packageSelect")!;
 const dropZone = document.querySelector<HTMLElement>("#dropZone")!;
 const selectedApkText = document.querySelector<HTMLElement>("#selectedApkText")!;
 const logEl = document.querySelector<HTMLElement>("#log")!;
@@ -83,8 +103,12 @@ function render() {
   installDepsButton.disabled = busy;
   checkDeviceButton.disabled = busy;
   pickApkButton.disabled = busy;
-  installApkButton.disabled = busy || !selectedApk;
+  installNormalApkButton.disabled = busy || !selectedApk;
+  installCarApkButton.disabled = busy || !selectedApk;
+  loadAppsButton.disabled = busy;
+  uninstallAppButton.disabled = busy || !selectedPackage;
   dropZone.classList.toggle("busy", busy);
+  renderPackageOptions();
 
   selectedApkText.textContent = selectedApk ?? "или нажмите «Выбрать APK»";
   deviceStatus.textContent = device?.connected ? "ГУ подключено" : "ADB не подключен";
@@ -150,6 +174,40 @@ installDepsButton.addEventListener("click", () => {
 
 checkDeviceButton.addEventListener("click", refreshDevice);
 
+loadAppsButton.addEventListener("click", () => {
+  runBusy(async () => {
+    addStep("info", "Загружаю список приложений");
+    uninstallablePackages = await invoke<string[]>("list_uninstallable_packages");
+    selectedPackage = uninstallablePackages[0] ?? null;
+    addStep("info", `Найдено приложений: ${uninstallablePackages.length}`);
+  });
+});
+
+packageSelect.addEventListener("change", () => {
+  selectedPackage = packageSelect.value || null;
+  render();
+});
+
+uninstallAppButton.addEventListener("click", () => {
+  const packageName = selectedPackage;
+  if (!packageName) {
+    return;
+  }
+
+  if (!window.confirm(`Удалить приложение ${packageName}?`)) {
+    return;
+  }
+
+  runBusy(async () => {
+    addStep("info", `Удаляю приложение: ${packageName}`);
+    const result = await invoke<Step[]>("uninstall_package", { packageName });
+    addSteps(result);
+    uninstallablePackages = uninstallablePackages.filter((name) => name !== packageName);
+    selectedPackage = uninstallablePackages[0] ?? null;
+    await refreshDevice();
+  });
+});
+
 pickApkButton.addEventListener("click", () => {
   runBusy(async () => {
     const picked = await open({
@@ -164,19 +222,34 @@ pickApkButton.addEventListener("click", () => {
   });
 });
 
-installApkButton.addEventListener("click", () => {
+installNormalApkButton.addEventListener("click", () => installSelectedApk(false));
+
+installCarApkButton.addEventListener("click", () => {
+  const confirmed = window.confirm(
+    "Этот режим может сделать приложение Device Owner, очистить данные Bluetooth и выдать расширенные ADB-права. Продолжить?"
+  );
+  if (confirmed) {
+    installSelectedApk(true);
+  }
+});
+
+function installSelectedApk(carManagement: boolean) {
   if (!selectedApk) {
     return;
   }
 
   runBusy(async () => {
-    addStep("info", "Начинаю установку APK");
-    const result = await invoke<InstallResult>("install_apk", { apkPath: selectedApk });
+    const mode = carManagement ? "с правом управления авто" : "обычного приложения";
+    addStep("info", `Начинаю установку APK в режиме: ${mode}`);
+    const result = await invoke<InstallResult>("install_apk", {
+      apkPath: selectedApk,
+      carManagement
+    });
     addSteps(result.steps);
     addStep("info", `Готово: ${result.package_name}`);
     await refreshDevice();
   });
-});
+}
 
 dropZone.addEventListener("click", () => pickApkButton.click());
 
@@ -205,6 +278,24 @@ function escapeHtml(value: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function renderPackageOptions() {
+  if (uninstallablePackages.length === 0) {
+    packageSelect.innerHTML = `<option value="">Список не загружен</option>`;
+    return;
+  }
+
+  if (!selectedPackage || !uninstallablePackages.includes(selectedPackage)) {
+    selectedPackage = uninstallablePackages[0];
+  }
+
+  packageSelect.innerHTML = uninstallablePackages
+    .map((packageName) => {
+      const selected = packageName === selectedPackage ? " selected" : "";
+      return `<option value="${escapeHtml(packageName)}"${selected}>${escapeHtml(packageName)}</option>`;
+    })
+    .join("");
 }
 
 refreshDevice();

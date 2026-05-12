@@ -40,6 +40,17 @@ button:disabled {
   opacity: 0.55;
 }
 
+select {
+  appearance: none;
+  background: #ffffff;
+  border: 1px solid #bac3cf;
+  border-radius: 6px;
+  color: #1d2430;
+  font: inherit;
+  min-height: 42px;
+  padding: 0 12px;
+}
+
 .shell {
   display: grid;
   gap: 18px;
@@ -101,6 +112,12 @@ h1 {
   flex-wrap: wrap;
 }
 
+.actions button {
+  flex: 1 1 320px;
+  min-height: 48px;
+  white-space: normal;
+}
+
 .primary {
   background: #255aef;
   border-color: #255aef;
@@ -110,6 +127,17 @@ h1 {
 .primary:hover:not(:disabled) {
   background: #1f4fd6;
   border-color: #1f4fd6;
+}
+
+.danger {
+  background: #b42318;
+  border-color: #b42318;
+  color: #ffffff;
+}
+
+.danger:hover:not(:disabled) {
+  background: #971d14;
+  border-color: #971d14;
 }
 
 .device-panel {
@@ -190,6 +218,35 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.app-manager {
+  background: #ffffff;
+  border: 1px solid #d2d9e3;
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.app-manager-header,
+.app-manager-controls {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.app-manager-header {
+  justify-content: space-between;
+}
+
+.app-manager h2 {
+  font-size: 18px;
+}
+
+.app-manager-controls select {
+  flex: 1 1 auto;
+  min-width: 260px;
+}
+
 .log-panel {
   background: #101722;
   border-radius: 8px;
@@ -236,5 +293,16 @@ h1 {
 
   .device-panel {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .app-manager-header,
+  .app-manager-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .app-manager-controls select {
+    min-width: 0;
+    width: 100%;
   }
 }
