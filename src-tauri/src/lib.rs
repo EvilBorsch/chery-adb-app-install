@@ -444,8 +444,6 @@ fn extract_notification_listener_candidates(
 
 fn apply_device_owner_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Applying Device Owner mode");
-    log.info("Clearing Bluetooth package before dpm set-device-owner");
-    run_optional(adb, ["shell", "pm", "clear", "com.android.bluetooth"], log);
 
     let candidates = device_admin_candidates(adb, package_name)?;
     if candidates.is_empty() {

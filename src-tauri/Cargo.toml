@@ -1,6 +1,6 @@
 [package]
 name = "desaysv-apk-installer"
-version = "1.0.0"
+version = "1.1.0"
 description = "APK installer for DesaySV Android head units"
 authors = ["EvilBorsch"]
 edition = "2021"
