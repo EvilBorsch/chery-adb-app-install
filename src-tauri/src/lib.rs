@@ -49,6 +49,20 @@ struct DeviceInfo {
     android: Option<String>,
 }
 
+struct AdbTarget {
+    path: PathBuf,
+    serial: String,
+}
+
+#[derive(Clone, Debug)]
+struct ListedDevice {
+    serial: String,
+    state: String,
+    model: Option<String>,
+    product: Option<String>,
+    usb: bool,
+}
+
 #[derive(Serialize)]
 struct InstallResult {
     package_name: String,
@@ -97,32 +111,27 @@ pub fn run() {
 
 #[tauri::command]
 fn check_device(app: AppHandle) -> Result<DeviceInfo> {
-    let adb = find_adb(&app)?;
-    let state = run_output(&adb, ["get-state"])?;
-    if !state.status.success() {
-        return Ok(DeviceInfo {
+    let adb_path = find_adb(&app)?;
+    match resolve_head_unit(&adb_path) {
+        Ok(adb) => {
+            let model = adb_shell_prop(&adb, "ro.product.model").ok();
+            let android = adb_shell_prop(&adb, "ro.build.version.release").ok();
+            Ok(DeviceInfo {
+                connected: true,
+                adb_path: Some(adb.path.display().to_string()),
+                serial: Some(adb.serial),
+                model,
+                android,
+            })
+        }
+        Err(_) => Ok(DeviceInfo {
             connected: false,
-            adb_path: Some(adb.display().to_string()),
+            adb_path: Some(adb_path.display().to_string()),
             serial: None,
             model: None,
             android: None,
-        });
+        }),
     }
-
-    let serial = run_output(&adb, ["get-serialno"])?
-        .stdout
-        .trim()
-        .to_string();
-    let model = adb_shell_prop(&adb, "ro.product.model").ok();
-    let android = adb_shell_prop(&adb, "ro.build.version.release").ok();
-
-    Ok(DeviceInfo {
-        connected: true,
-        adb_path: Some(adb.display().to_string()),
-        serial: non_empty(serial),
-        model,
-        android,
-    })
 }
 
 #[tauri::command]
@@ -178,8 +187,8 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     }
 
     let mut log = WorkLog::new();
-    let adb = find_adb(&app)?;
-    ensure_device(&adb)?;
+    let adb_path = find_adb(&app)?;
+    let adb = ensure_device(&adb_path)?;
     if car_management {
         apply_vehicle_preinstall(&adb, &mut log);
     }
@@ -192,18 +201,18 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     let helper = resource_localinstall(&app)?;
 
     log.info("Копирую APK на устройство");
-    run_checked(&adb, ["push", path_arg(&apk_path).as_str(), remote_apk])?;
-    run_checked(&adb, ["shell", "chmod", "644", remote_apk])?;
+    run_adb_checked(&adb, ["push", path_arg(&apk_path).as_str(), remote_apk])?;
+    run_adb_checked(&adb, ["shell", "chmod", "644", remote_apk])?;
 
     log.info("Копирую helper установки");
-    run_checked(&adb, ["push", path_arg(&helper).as_str(), remote_helper])?;
-    run_checked(&adb, ["shell", "chmod", "644", remote_helper])?;
+    run_adb_checked(&adb, ["push", path_arg(&helper).as_str(), remote_helper])?;
+    run_adb_checked(&adb, ["shell", "chmod", "644", remote_helper])?;
 
     log.info("Устанавливаю APK через PackageInstaller.Session");
     let install_cmd = format!(
         "CLASSPATH={remote_helper} /system/bin/app_process /system/bin LocalInstall {remote_apk}"
     );
-    let output = run_checked(&adb, ["shell", install_cmd.as_str()])?;
+    let output = run_adb_checked(&adb, ["shell", install_cmd.as_str()])?;
     append_output(&mut log, output);
 
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -220,12 +229,12 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
         apply_device_owner_inner(&adb, &package_name, &mut log)?;
     }
 
-    run_optional(
+    run_adb_optional(
         &adb,
         ["shell", "am", "force-stop", package_name.as_str()],
         &mut log,
     );
-    run_optional(
+    run_adb_optional(
         &adb,
         [
             "shell",
@@ -238,7 +247,7 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
         ],
         &mut log,
     );
-    run_optional(
+    run_adb_optional(
         &adb,
         ["shell", "rm", "-f", remote_apk, remote_helper],
         &mut log,
@@ -252,8 +261,8 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
 
 #[tauri::command]
 fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
-    let adb = find_adb(&app)?;
-    ensure_device(&adb)?;
+    let adb_path = find_adb(&app)?;
+    let adb = ensure_device(&adb_path)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
             "Пакет не установлен: {package_name}"
@@ -267,10 +276,10 @@ fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
 
 #[tauri::command]
 fn list_uninstallable_packages(app: AppHandle) -> Result<Vec<String>> {
-    let adb = find_adb(&app)?;
-    ensure_device(&adb)?;
+    let adb_path = find_adb(&app)?;
+    let adb = ensure_device(&adb_path)?;
 
-    let output = run_checked(&adb, ["shell", "pm", "list", "packages", "-3"])?;
+    let output = run_adb_checked(&adb, ["shell", "pm", "list", "packages", "-3"])?;
     let mut packages: Vec<String> = output
         .stdout
         .lines()
@@ -289,8 +298,8 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
         )));
     }
 
-    let adb = find_adb(&app)?;
-    ensure_device(&adb)?;
+    let adb_path = find_adb(&app)?;
+    let adb = ensure_device(&adb_path)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
             "Package is not installed: {package_name}"
@@ -299,16 +308,16 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
 
     let mut log = WorkLog::new();
     log.info(format!("Uninstalling package: {package_name}"));
-    let output = run_checked(&adb, ["shell", "pm", "uninstall", package_name.as_str()])?;
+    let output = run_adb_checked(&adb, ["shell", "pm", "uninstall", package_name.as_str()])?;
     append_output(&mut log, output);
     log.info(format!("Uninstalled: {package_name}"));
     Ok(log.steps)
 }
 
-fn grant_permissions_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Выдаю runtime permissions из manifest");
     for permission in requested_permissions(adb, package_name)? {
-        let output = run_output(
+        let output = run_adb(
             adb,
             ["shell", "pm", "grant", package_name, permission.as_str()],
         )?;
@@ -327,7 +336,7 @@ fn grant_permissions_inner(adb: &Path, package_name: &str, log: &mut WorkLog) ->
         "SCHEDULE_EXACT_ALARM",
         "ACCESS_NOTIFICATIONS",
     ] {
-        let output = run_output(adb, ["shell", "appops", "set", package_name, op, "allow"])?;
+        let output = run_adb(adb, ["shell", "appops", "set", package_name, op, "allow"])?;
         if output.status.success() {
             log.info(format!("appop: {op}=allow"));
         }
@@ -336,12 +345,12 @@ fn grant_permissions_inner(adb: &Path, package_name: &str, log: &mut WorkLog) ->
     Ok(())
 }
 
-fn apply_vehicle_preinstall(adb: &Path, log: &mut WorkLog) {
+fn apply_vehicle_preinstall(adb: &AdbTarget, log: &mut WorkLog) {
     log.info("Applying vehicle integration pre-install flag");
-    run_optional(adb, ["shell", "setprop", "persist.sys.sv.isl", "true"], log);
+    run_adb_optional(adb, ["shell", "setprop", "persist.sys.sv.isl", "true"], log);
 }
 
-fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn apply_vehicle_management_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Applying vehicle-management compatibility commands");
     apply_vehicle_preinstall(adb, log);
 
@@ -353,7 +362,7 @@ fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut Work
         "android.permission.RECORD_AUDIO",
         "android.permission.BLUETOOTH_CONNECT",
     ] {
-        run_optional(adb, ["shell", "pm", "grant", package_name, permission], log);
+        run_adb_optional(adb, ["shell", "pm", "grant", package_name, permission], log);
     }
 
     for op in [
@@ -363,7 +372,7 @@ fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut Work
         "ACTIVATE_VPN",
         "android:write_settings",
     ] {
-        run_optional(
+        run_adb_optional(
             adb,
             ["shell", "appops", "set", package_name, op, "allow"],
             log,
@@ -371,7 +380,7 @@ fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut Work
     }
 
     for component in notification_listener_candidates(adb, package_name)? {
-        run_optional(
+        run_adb_optional(
             adb,
             [
                 "shell",
@@ -384,7 +393,7 @@ fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut Work
         );
     }
     let whitelist_package = format!("+{package_name}");
-    run_optional(
+    run_adb_optional(
         adb,
         [
             "shell",
@@ -399,9 +408,9 @@ fn apply_vehicle_management_inner(adb: &Path, package_name: &str, log: &mut Work
     Ok(())
 }
 
-fn notification_listener_candidates(adb: &Path, package_name: &str) -> Result<Vec<String>> {
+fn notification_listener_candidates(adb: &AdbTarget, package_name: &str) -> Result<Vec<String>> {
     let mut candidates = Vec::new();
-    let query = run_output(
+    let query = run_adb(
         adb,
         [
             "shell",
@@ -417,7 +426,7 @@ fn notification_listener_candidates(adb: &Path, package_name: &str) -> Result<Ve
         extract_component_candidates(package_name, &query.stdout, &mut candidates);
     }
 
-    let dump = run_output(adb, ["shell", "dumpsys", "package", package_name])?;
+    let dump = run_adb(adb, ["shell", "dumpsys", "package", package_name])?;
     if dump.status.success() {
         extract_notification_listener_candidates(package_name, &dump.stdout, &mut candidates);
     }
@@ -442,7 +451,7 @@ fn extract_notification_listener_candidates(
     }
 }
 
-fn apply_device_owner_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn apply_device_owner_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Applying Device Owner mode");
 
     let candidates = device_admin_candidates(adb, package_name)?;
@@ -455,12 +464,12 @@ fn apply_device_owner_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -
 
     for component in candidates {
         log.info(format!("Trying Device Owner receiver: {component}"));
-        let output = run_output(
+        let output = run_adb(
             adb,
             ["shell", "dpm", "set-device-owner", component.as_str()],
         )?;
         append_output(log, output);
-        let verify = run_output(adb, ["shell", "dpm", "get-device-owner"])?;
+        let verify = run_adb(adb, ["shell", "dpm", "get-device-owner"])?;
         if verify.status.success() && verify.stdout.contains(package_name) {
             log.info(format!("Device Owner enabled: {component}"));
             return Ok(());
@@ -473,10 +482,10 @@ fn apply_device_owner_inner(adb: &Path, package_name: &str, log: &mut WorkLog) -
     Ok(())
 }
 
-fn device_admin_candidates(adb: &Path, package_name: &str) -> Result<Vec<String>> {
+fn device_admin_candidates(adb: &AdbTarget, package_name: &str) -> Result<Vec<String>> {
     let mut candidates = Vec::new();
 
-    let query = run_output(
+    let query = run_adb(
         adb,
         [
             "shell",
@@ -492,7 +501,7 @@ fn device_admin_candidates(adb: &Path, package_name: &str) -> Result<Vec<String>
         extract_component_candidates(package_name, &query.stdout, &mut candidates);
     }
 
-    let dump = run_output(adb, ["shell", "dumpsys", "package", package_name])?;
+    let dump = run_adb(adb, ["shell", "dumpsys", "package", package_name])?;
     if dump.status.success() {
         extract_device_admin_candidates(package_name, &dump.stdout, &mut candidates);
     }
@@ -559,8 +568,8 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-fn requested_permissions(adb: &Path, package_name: &str) -> Result<Vec<String>> {
-    let output = run_checked(adb, ["shell", "dumpsys", "package", package_name])?;
+fn requested_permissions(adb: &AdbTarget, package_name: &str) -> Result<Vec<String>> {
+    let output = run_adb_checked(adb, ["shell", "dumpsys", "package", package_name])?;
     let text = output.stdout;
     let mut in_requested = false;
     let mut permissions = Vec::new();
@@ -599,18 +608,179 @@ fn find_adb(app: &AppHandle) -> Result<PathBuf> {
     })
 }
 
-fn ensure_device(adb: &Path) -> Result<()> {
-    let output = run_output(adb, ["get-state"])?;
-    if output.status.success() && output.stdout.trim() == "device" {
-        return Ok(());
-    }
-    Err(InstallerError::Message(
-        "ADB-устройство не подключено или не авторизовано".to_string(),
-    ))
+fn ensure_device(adb_path: &Path) -> Result<AdbTarget> {
+    resolve_head_unit(adb_path)
 }
 
-fn list_packages(adb: &Path) -> Result<Vec<String>> {
-    let output = run_checked(adb, ["shell", "pm", "list", "packages"])?;
+fn resolve_head_unit(adb_path: &Path) -> Result<AdbTarget> {
+    let devices = list_adb_devices(adb_path)?;
+    let online: Vec<&ListedDevice> = devices
+        .iter()
+        .filter(|device| device.state == "device")
+        .collect();
+
+    if online.is_empty() {
+        return Err(InstallerError::Message(
+            "ADB-устройство не подключено или не авторизовано".to_string(),
+        ));
+    }
+
+    let selected = select_head_unit(&online).ok_or_else(|| {
+        InstallerError::Message(
+            "ГУ не найдено среди подключенных ADB-устройств".to_string(),
+        )
+    })?;
+
+    Ok(AdbTarget {
+        path: adb_path.to_path_buf(),
+        serial: selected.serial.clone(),
+    })
+}
+
+fn list_adb_devices(adb_path: &Path) -> Result<Vec<ListedDevice>> {
+    let output = run_output(adb_path, ["devices", "-l"])?;
+    if !output.status.success() {
+        return Err(InstallerError::Message(format!(
+            "Не удалось получить список ADB-устройств: {}{}",
+            output.stdout, output.stderr
+        )));
+    }
+
+    let mut devices = Vec::new();
+    for line in output.stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List of devices") {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(serial) = parts.next() else {
+            continue;
+        };
+        let Some(state) = parts.next() else {
+            continue;
+        };
+
+        let mut model = None;
+        let mut product = None;
+        let mut usb = false;
+        for part in parts {
+            if let Some(value) = part.strip_prefix("model:") {
+                model = Some(value.replace('_', " "));
+            } else if let Some(value) = part.strip_prefix("product:") {
+                product = Some(value.to_string());
+            } else if part.starts_with("usb:") {
+                usb = true;
+            }
+        }
+
+        // USB serials are hex ids like bd6bf956; network targets look like host:port.
+        if !usb && !serial.contains(':') {
+            usb = true;
+        }
+
+        devices.push(ListedDevice {
+            serial: serial.to_string(),
+            state: state.to_string(),
+            model,
+            product,
+            usb,
+        });
+    }
+
+    Ok(devices)
+}
+
+fn select_head_unit<'a>(devices: &[&'a ListedDevice]) -> Option<&'a ListedDevice> {
+    // Prefer DesaySV / Chery head units over leftover network/watch ADB sessions.
+    devices
+        .iter()
+        .copied()
+        .filter(|device| device.usb || is_truncated_hex_serial(&device.serial))
+        .max_by_key(|device| head_unit_score(device))
+        .or_else(|| {
+            devices
+                .iter()
+                .copied()
+                .filter(|device| is_truncated_hex_serial(&device.serial))
+                .max_by_key(|device| head_unit_score(device))
+        })
+        .or_else(|| devices.iter().copied().max_by_key(|device| head_unit_score(device)))
+}
+
+fn head_unit_score(device: &ListedDevice) -> i32 {
+    let mut score = 0;
+    let model = device.model.as_deref().unwrap_or("").to_ascii_lowercase();
+    let product = device.product.as_deref().unwrap_or("").to_ascii_lowercase();
+
+    if model.contains("desaysv") || product.contains("desay") {
+        score += 100;
+    }
+    if product.contains("g7ph") || product.contains("t22") {
+        score += 40;
+    }
+    if device.usb {
+        score += 30;
+    }
+    if is_truncated_hex_serial(&device.serial) {
+        score += 20;
+    }
+    if device.serial.contains(':') {
+        score -= 50;
+    }
+    score
+}
+
+fn is_truncated_hex_serial(serial: &str) -> bool {
+    let len = serial.len();
+    (6..=16).contains(&len)
+        && !serial.contains(':')
+        && serial.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn run_adb<I, S>(adb: &AdbTarget, args: I) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut full_args: Vec<OsString> = vec!["-s".into(), adb.serial.as_str().into()];
+    full_args.extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
+    run_output(&adb.path, full_args)
+}
+
+fn run_adb_checked<I, S>(adb: &AdbTarget, args: I) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = run_adb(adb, args)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(InstallerError::Message(format!(
+            "Команда завершилась с ошибкой: {}\n{}{}",
+            output.command, output.stdout, output.stderr
+        )))
+    }
+}
+
+fn run_adb_optional<I, S>(adb: &AdbTarget, args: I, log: &mut WorkLog)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    match run_adb(adb, args) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => log.warn(format!(
+            "Необязательная команда завершилась с ошибкой: {}\n{}",
+            output.command, output.stderr
+        )),
+        Err(err) => log.warn(format!("Необязательная команда не выполнена: {err}")),
+    }
+}
+
+fn list_packages(adb: &AdbTarget) -> Result<Vec<String>> {
+    let output = run_adb_checked(adb, ["shell", "pm", "list", "packages"])?;
     let text = output.stdout;
     Ok(text
         .lines()
@@ -618,8 +788,8 @@ fn list_packages(adb: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn is_package_installed(adb: &Path, package_name: &str) -> Result<bool> {
-    let output = run_output(adb, ["shell", "pm", "list", "packages", package_name])?;
+fn is_package_installed(adb: &AdbTarget, package_name: &str) -> Result<bool> {
+    let output = run_adb(adb, ["shell", "pm", "list", "packages", package_name])?;
     Ok(output
         .stdout
         .lines()
@@ -634,7 +804,7 @@ fn is_safe_package_name(package_name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
 }
 
-fn detect_new_package(adb: &Path, before: &[String]) -> Result<String> {
+fn detect_new_package(adb: &AdbTarget, before: &[String]) -> Result<String> {
     let after = list_packages(adb)?;
     after
         .into_iter()
@@ -725,8 +895,8 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-fn adb_shell_prop(adb: &Path, prop: &str) -> Result<String> {
-    let output = run_checked(adb, ["shell", "getprop", prop])?;
+fn adb_shell_prop(adb: &AdbTarget, prop: &str) -> Result<String> {
+    let output = run_adb_checked(adb, ["shell", "getprop", prop])?;
     Ok(output.stdout.trim().to_string())
 }
 
@@ -735,22 +905,6 @@ struct CommandOutput {
     stdout: String,
     stderr: String,
     command: String,
-}
-
-fn run_checked<I, S>(program: &Path, args: I) -> Result<CommandOutput>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = run_output(program, args)?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(InstallerError::Message(format!(
-            "Команда завершилась с ошибкой: {}\n{}{}",
-            output.command, output.stdout, output.stderr
-        )))
-    }
 }
 
 fn run_output<I, S>(program: &Path, args: I) -> Result<CommandOutput>
@@ -784,21 +938,6 @@ where
     })
 }
 
-fn run_optional<I, S>(program: &Path, args: I, log: &mut WorkLog)
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    match run_output(program, args) {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => log.warn(format!(
-            "Необязательная команда завершилась с ошибкой: {}\n{}",
-            output.command, output.stderr
-        )),
-        Err(err) => log.warn(format!("Необязательная команда не выполнена: {err}")),
-    }
-}
-
 fn append_output(log: &mut WorkLog, output: CommandOutput) {
     for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
         log.info(line.to_string());
@@ -810,12 +949,4 @@ fn append_output(log: &mut WorkLog, output: CommandOutput) {
 
 fn path_arg(path: &Path) -> String {
     path.display().to_string()
-}
-
-fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
 }
