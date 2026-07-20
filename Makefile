@@ -18,7 +18,7 @@ dev:
 	npm run tauri dev
 
 build:
-	npm run tauri build
+	RUSTFLAGS="--remap-path-prefix=$(HOME)=/ --remap-path-prefix=$(CURDIR)=." npm run tauri build
 
 check:
 	npm run build
