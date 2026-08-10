@@ -45,7 +45,6 @@ app.innerHTML = `
     </header>
 
     <section class="toolbar">
-      <button id="installDeps" type="button">Установить зависимости</button>
       <button id="checkDevice" type="button">Проверить ГУ</button>
       <button id="pickApk" type="button">Выбрать APK</button>
     </section>
@@ -85,7 +84,6 @@ app.innerHTML = `
   </section>
 `;
 
-const installDepsButton = document.querySelector<HTMLButtonElement>("#installDeps")!;
 const checkDeviceButton = document.querySelector<HTMLButtonElement>("#checkDevice")!;
 const pickApkButton = document.querySelector<HTMLButtonElement>("#pickApk")!;
 const installNormalApkButton = document.querySelector<HTMLButtonElement>("#installNormalApk")!;
@@ -100,7 +98,6 @@ const deviceStatus = document.querySelector<HTMLElement>("#deviceStatus")!;
 const devicePanel = document.querySelector<HTMLElement>("#devicePanel")!;
 
 function render() {
-  installDepsButton.disabled = busy;
   checkDeviceButton.disabled = busy;
   pickApkButton.disabled = busy;
   installNormalApkButton.disabled = busy || !selectedApk;
@@ -162,15 +159,6 @@ async function refreshDevice() {
     addStep(device.connected ? "info" : "warn", device.connected ? "ГУ найдено" : "ГУ не найдено");
   });
 }
-
-installDepsButton.addEventListener("click", () => {
-  runBusy(async () => {
-    addStep("info", "Устанавливаю Android platform-tools");
-    const result = await invoke<Step[]>("install_dependencies");
-    addSteps(result);
-    await refreshDevice();
-  });
-});
 
 checkDeviceButton.addEventListener("click", refreshDevice);
 

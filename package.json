@@ -1,7 +1,7 @@
 {
   "name": "desaysv-apk-installer-tauri",
   "private": true,
-  "version": "1.1.2",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",

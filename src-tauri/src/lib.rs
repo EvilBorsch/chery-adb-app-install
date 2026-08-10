@@ -1,6 +1,5 @@
 use serde::Serialize;
 use std::{
-    env,
     ffi::{OsStr, OsString},
     fs,
     io::{self, Cursor, Read},
@@ -19,8 +18,6 @@ enum InstallerError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
-    #[error(transparent)]
-    Http(#[from] ureq::Error),
 }
 
 impl serde::Serialize for InstallerError {
@@ -33,6 +30,21 @@ impl serde::Serialize for InstallerError {
 }
 
 type Result<T> = std::result::Result<T, InstallerError>;
+
+const AXML_FILE: usize = 0x0003;
+const AXML_STRING_POOL: usize = 0x0001;
+const AXML_START_ELEMENT: usize = 0x0102;
+
+// adb вшит в бинарь: приложение должно работать сразу, без скачивания platform-tools.
+// Версия входит в путь распаковки, чтобы обновление приложения не оставляло старый adb.
+const ADB_VERSION: &str = "37.0.1";
+
+#[cfg(target_os = "macos")]
+const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-macos.zip");
+#[cfg(target_os = "windows")]
+const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-windows.zip");
+#[cfg(target_os = "linux")]
+const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-linux.zip");
 
 #[derive(Clone, Serialize)]
 struct Step {
@@ -99,7 +111,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             check_device,
-            install_dependencies,
             install_apk,
             grant_permissions,
             list_uninstallable_packages,
@@ -111,7 +122,7 @@ pub fn run() {
 
 #[tauri::command]
 fn check_device(app: AppHandle) -> Result<DeviceInfo> {
-    let adb_path = find_adb(&app)?;
+    let adb_path = ensure_adb(&app)?;
     match resolve_head_unit(&adb_path) {
         Ok(adb) => {
             let model = adb_shell_prop(&adb, "ro.product.model").ok();
@@ -135,48 +146,6 @@ fn check_device(app: AppHandle) -> Result<DeviceInfo> {
 }
 
 #[tauri::command]
-fn install_dependencies(app: AppHandle) -> Result<Vec<Step>> {
-    let mut log = WorkLog::new();
-    let tools_dir = tools_dir(&app)?;
-    let adb_path = adb_path_in_tools(&tools_dir);
-
-    if adb_path.exists() {
-        log.info(format!("ADB уже установлен: {}", adb_path.display()));
-        return Ok(log.steps);
-    }
-
-    fs::create_dir_all(&tools_dir)?;
-    let url = platform_tools_url()?;
-    log.info(format!("Скачиваю Android platform-tools: {url}"));
-
-    let mut response = ureq::get(url).call()?;
-    let mut bytes = Vec::new();
-    response.body_mut().as_reader().read_to_end(&mut bytes)?;
-
-    log.info("Распаковываю platform-tools");
-    let mut archive = ZipArchive::new(Cursor::new(bytes))?;
-    archive.extract(&tools_dir)?;
-
-    let adb_path = adb_path_in_tools(&tools_dir);
-    if !adb_path.exists() {
-        return Err(InstallerError::Message(
-            "ADB не найден после распаковки platform-tools".to_string(),
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&adb_path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&adb_path, permissions)?;
-    }
-
-    log.info(format!("ADB готов: {}", adb_path.display()));
-    Ok(log.steps)
-}
-
-#[tauri::command]
 fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result<InstallResult> {
     let apk_path = PathBuf::from(apk_path);
     if !apk_path.is_file() {
@@ -187,14 +156,14 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     }
 
     let mut log = WorkLog::new();
-    let adb_path = find_adb(&app)?;
+    let adb_path = ensure_adb(&app)?;
     let adb = ensure_device(&adb_path)?;
     if car_management {
         apply_vehicle_preinstall(&adb, &mut log);
     }
 
     let package_before = list_packages(&adb)?;
-    let package_hint = detect_package_with_aapt(&apk_path).ok();
+    let package_hint = apk_package_name(&apk_path).ok();
 
     let remote_apk = "/data/local/tmp/desaysv-install-target.apk";
     let remote_helper = "/data/local/tmp/desaysv-localinstall.apk";
@@ -208,6 +177,15 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     run_adb_checked(&adb, ["push", path_arg(&helper).as_str(), remote_helper])?;
     run_adb_checked(&adb, ["shell", "chmod", "644", remote_helper])?;
 
+    // Сессионный установщик не умеет ставить поверх («Attempt to re-install without first
+    // uninstalling»), а данные прошлой версии не дадут поставить APK с другой подписью.
+    if let Some(package) = package_hint.as_deref() {
+        if is_package_installed(&adb, package)? {
+            log.info(format!("Снимаю установленную версию {package}"));
+            run_adb_optional(&adb, ["shell", "pm", "uninstall", package], &mut log);
+        }
+    }
+
     log.info("Устанавливаю APK через PackageInstaller.Session");
     let install_cmd = format!(
         "CLASSPATH={remote_helper} /system/bin/app_process /system/bin LocalInstall {remote_apk}"
@@ -219,7 +197,37 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
 
     let package_name = match package_hint {
         Some(package) if is_package_installed(&adb, &package)? => package,
-        _ => detect_new_package(&adb, &package_before)?,
+        // PackageInstaller отдаёт результат асинхронно, helper его не дожидается,
+        // поэтому причину отказа забираем из лога PackageManager.
+        Some(package) => {
+            let reason = run_adb(
+                &adb,
+                [
+                    "shell",
+                    "logcat",
+                    "-d",
+                    "-t",
+                    "600",
+                    "-s",
+                    "PackageManager:W",
+                ],
+            )
+            .ok()
+            .and_then(|output| {
+                output
+                    .stdout
+                    .lines()
+                    .rev()
+                    .find(|line| line.contains(package.as_str()))
+                    .map(str::trim)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "причина не найдена в логе PackageManager".to_string());
+            return Err(InstallerError::Message(format!(
+                "Установка {package} не завершилась: {reason}"
+            )));
+        }
+        None => detect_new_package(&adb, &package_before)?,
     };
 
     log.info(format!("Пакет установлен: {package_name}"));
@@ -261,7 +269,7 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
 
 #[tauri::command]
 fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
-    let adb_path = find_adb(&app)?;
+    let adb_path = ensure_adb(&app)?;
     let adb = ensure_device(&adb_path)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
@@ -276,7 +284,7 @@ fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
 
 #[tauri::command]
 fn list_uninstallable_packages(app: AppHandle) -> Result<Vec<String>> {
-    let adb_path = find_adb(&app)?;
+    let adb_path = ensure_adb(&app)?;
     let adb = ensure_device(&adb_path)?;
 
     let output = run_adb_checked(&adb, ["shell", "pm", "list", "packages", "-3"])?;
@@ -298,7 +306,7 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
         )));
     }
 
-    let adb_path = find_adb(&app)?;
+    let adb_path = ensure_adb(&app)?;
     let adb = ensure_device(&adb_path)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
@@ -313,6 +321,9 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
     log.info(format!("Uninstalled: {package_name}"));
     Ok(log.steps)
 }
+
+// Сколько раз перевыдаём право на фиктивные местоположения, пока установка доезжает
+const MOCK_LOCATION_ATTEMPTS: usize = 4;
 
 fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Выдаю runtime permissions из manifest");
@@ -335,12 +346,49 @@ fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLo
         "REQUEST_INSTALL_PACKAGES",
         "SCHEDULE_EXACT_ALARM",
         "ACCESS_NOTIFICATIONS",
+        // Шеринг GPS: без него лаунчер не может отдать машине координаты телефона. На ГУ
+        // выдать это право руками негде — в прошивке нет пункта «приложение для фиктивных
+        // местоположений», а чистая установка (не update) сбрасывает все appops
+        "android:mock_location",
     ] {
         let output = run_adb(adb, ["shell", "appops", "set", package_name, op, "allow"])?;
         if output.status.success() {
             log.info(format!("appop: {op}=allow"));
         }
     }
+
+    // Право на фиктивные местоположения проверяем отдельно: без него шеринг GPS молча не
+    // работает, а на ГУ выдать его руками негде — в прошивке нет пункта developer options.
+    // Раньше отказ appops не был виден вообще: код возврата adb shell об этом не говорит,
+    // и «нет права» всплывало уже в машине.
+    // Установка большого APK доезжает асинхронно, и appop, выданный на недоустановленный
+    // пакет, теряется молча: adb shell об этом не сообщает никак. Поэтому здесь читаем
+    // фактическое состояние и повторяем выдачу, пока оно не станет allow
+    let mut mock_state = String::new();
+    for attempt in 0..MOCK_LOCATION_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            run_adb(
+                adb,
+                ["shell", "appops", "set", package_name, "android:mock_location", "allow"],
+            )?;
+        }
+        mock_state = run_adb(
+            adb,
+            ["shell", "cmd", "appops", "get", package_name, "android:mock_location"],
+        )?
+        .stdout;
+        if mock_state.contains("allow") {
+            log.info("Фиктивные местоположения разрешены");
+            return Ok(());
+        }
+    }
+
+    log.warn(format!(
+        "Фиктивные местоположения НЕ разрешены ({}) — шеринг GPS работать не будет. \
+         Выдайте вручную: adb shell appops set {package_name} android:mock_location allow",
+        mock_state.trim()
+    ));
 
     Ok(())
 }
@@ -371,6 +419,7 @@ fn apply_vehicle_management_inner(adb: &AdbTarget, package_name: &str, log: &mut
         "MANAGE_EXTERNAL_STORAGE",
         "ACTIVATE_VPN",
         "android:write_settings",
+        "android:mock_location",
     ] {
         run_adb_optional(
             adb,
@@ -594,18 +643,46 @@ fn requested_permissions(adb: &AdbTarget, package_name: &str) -> Result<Vec<Stri
     Ok(permissions)
 }
 
-fn find_adb(app: &AppHandle) -> Result<PathBuf> {
-    let bundled = adb_path_in_tools(&tools_dir(app)?);
-    if bundled.exists() {
-        return Ok(bundled);
+/// Кладёт вшитый adb на диск: запустить его из константы нельзя, а на Windows рядом с adb.exe
+/// должны лежать его DLL, поэтому распаковываем весь архив в app data dir.
+fn ensure_adb(app: &AppHandle) -> Result<PathBuf> {
+    let base = app_data_dir(app)?;
+    let tools_dir = base.join("adb").join(ADB_VERSION);
+    let adb_path = tools_dir.join(adb_exe_name());
+    if adb_path.is_file() {
+        return Ok(adb_path);
     }
 
-    find_in_path(adb_exe_name()).ok_or_else(|| {
-        InstallerError::Message(
-            "ADB не найден. Нажмите «Установить зависимости» или установите Android platform-tools."
-                .to_string(),
-        )
-    })
+    // Версии до 1.2 качали platform-tools целиком, чистим за ними ~50 МБ.
+    let downloaded_tools = base.join("android-platform-tools");
+    if downloaded_tools.exists() {
+        fs::remove_dir_all(&downloaded_tools)?;
+    }
+
+    // Распаковываем в отдельный каталог и переносим целиком: прерванная распаковка не должна
+    // оставить нерабочий adb, который на следующем запуске сочтут готовым.
+    let staging = base.join("adb").join(format!("{ADB_VERSION}.unpacking"));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    ZipArchive::new(Cursor::new(ADB_BUNDLE))?.extract(&staging)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let staged_adb = staging.join(adb_exe_name());
+        let mut permissions = fs::metadata(&staged_adb)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&staged_adb, permissions)?;
+    }
+
+    if tools_dir.exists() {
+        fs::remove_dir_all(&tools_dir)?;
+    }
+    fs::rename(&staging, &tools_dir)?;
+
+    Ok(adb_path)
 }
 
 fn ensure_device(adb_path: &Path) -> Result<AdbTarget> {
@@ -816,34 +893,108 @@ fn detect_new_package(adb: &AdbTarget, before: &[String]) -> Result<String> {
         })
 }
 
-fn detect_package_with_aapt(apk_path: &Path) -> Result<String> {
-    let aapt = find_in_path("aapt")
-        .or_else(|| find_in_path("aapt2"))
-        .ok_or_else(|| InstallerError::Message("aapt/aapt2 не найден".to_string()))?;
+/// Читает package из бинарного AndroidManifest.xml внутри APK: aapt в системе может
+/// не быть, а у собранного приложения PATH урезан до системного.
+fn apk_package_name(apk_path: &Path) -> Result<String> {
+    let mut archive = ZipArchive::new(fs::File::open(apk_path)?)?;
+    let mut data = Vec::new();
+    archive
+        .by_name("AndroidManifest.xml")?
+        .read_to_end(&mut data)?;
 
-    let output = if aapt.file_name().and_then(|v| v.to_str()) == Some("aapt2") {
-        run_output(&aapt, ["dump", "badging", path_arg(apk_path).as_str()])?
-    } else {
-        run_output(&aapt, ["dump", "badging", path_arg(apk_path).as_str()])?
-    };
-
-    if !output.status.success() {
+    if le_u16(&data, 0) != AXML_FILE {
         return Err(InstallerError::Message(
-            "aapt не смог прочитать APK".to_string(),
+            "AndroidManifest.xml не в бинарном формате".to_string(),
         ));
     }
 
-    let text = output.stdout;
-    let marker = "package: name='";
-    let start = text
-        .find(marker)
-        .ok_or_else(|| InstallerError::Message("package name not found".to_string()))?
-        + marker.len();
-    let rest = &text[start..];
-    let end = rest
-        .find('\'')
-        .ok_or_else(|| InstallerError::Message("package name not found".to_string()))?;
-    Ok(rest[..end].to_string())
+    let mut strings: Vec<String> = Vec::new();
+    let mut offset = le_u16(&data, 2);
+    while offset + 8 <= data.len() {
+        let chunk_type = le_u16(&data, offset);
+        let chunk_size = le_u32(&data, offset + 4);
+        if chunk_size < 8 || offset + chunk_size > data.len() {
+            break;
+        }
+
+        if chunk_type == AXML_STRING_POOL {
+            strings = axml_strings(&data, offset);
+        } else if chunk_type == AXML_START_ELEMENT
+            && strings.get(le_u32(&data, offset + 20)).map(String::as_str) == Some("manifest")
+        {
+            let attributes = offset + 16 + le_u16(&data, offset + 24);
+            let attribute_size = le_u16(&data, offset + 26);
+            for index in 0..le_u16(&data, offset + 28) {
+                let field = attributes + index * attribute_size;
+                if strings.get(le_u32(&data, field + 4)).map(String::as_str) == Some("package") {
+                    // Значение атрибута лежит либо в raw-строке, либо в типизированном поле.
+                    let raw = le_u32(&data, field + 8);
+                    let value = if raw == 0xFFFF_FFFF {
+                        le_u32(&data, field + 16)
+                    } else {
+                        raw
+                    };
+                    return strings.get(value).cloned().ok_or_else(|| {
+                        InstallerError::Message("package в манифесте пуст".to_string())
+                    });
+                }
+            }
+            break;
+        }
+
+        offset += chunk_size;
+    }
+
+    Err(InstallerError::Message(
+        "не нашёл package в AndroidManifest.xml".to_string(),
+    ))
+}
+
+/// Разбирает пул строк AXML: строки лежат в UTF-8 или UTF-16 с длиной переменного размера.
+fn axml_strings(data: &[u8], offset: usize) -> Vec<String> {
+    let count = le_u32(data, offset + 8);
+    let utf8 = le_u32(data, offset + 16) & 0x100 != 0;
+    let strings_start = offset + le_u32(data, offset + 20);
+    let offsets = offset + le_u16(data, offset + 2);
+
+    (0..count)
+        .map(|index| {
+            let mut entry = strings_start + le_u32(data, offsets + index * 4);
+            if utf8 {
+                entry += if data[entry] & 0x80 != 0 { 2 } else { 1 };
+                let length = if data[entry] & 0x80 != 0 {
+                    let long = ((data[entry] as usize & 0x7F) << 8) | data[entry + 1] as usize;
+                    entry += 2;
+                    long
+                } else {
+                    let short = data[entry] as usize;
+                    entry += 1;
+                    short
+                };
+                String::from_utf8_lossy(&data[entry..entry + length]).into_owned()
+            } else {
+                let length = le_u16(data, entry) & 0x7FFF;
+                entry += 2;
+                let units: Vec<u16> = (0..length)
+                    .map(|unit| le_u16(data, entry + unit * 2) as u16)
+                    .collect();
+                String::from_utf16_lossy(&units)
+            }
+        })
+        .collect()
+}
+
+fn le_u16(data: &[u8], offset: usize) -> usize {
+    u16::from_le_bytes([data[offset], data[offset + 1]]) as usize
+}
+
+fn le_u32(data: &[u8], offset: usize) -> usize {
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize
 }
 
 fn resource_localinstall(app: &AppHandle) -> Result<PathBuf> {
@@ -855,15 +1006,10 @@ fn resource_localinstall(app: &AppHandle) -> Result<PathBuf> {
         .map_err(|err| InstallerError::Message(format!("Не найден localinstall.apk: {err}")))
 }
 
-fn tools_dir(app: &AppHandle) -> Result<PathBuf> {
-    let base = app.path().app_data_dir().map_err(|err| {
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf> {
+    app.path().app_data_dir().map_err(|err| {
         InstallerError::Message(format!("Не удалось получить app data dir: {err}"))
-    })?;
-    Ok(base.join("android-platform-tools"))
-}
-
-fn adb_path_in_tools(tools_dir: &Path) -> PathBuf {
-    tools_dir.join("platform-tools").join(adb_exe_name())
+    })
 }
 
 fn adb_exe_name() -> &'static str {
@@ -872,27 +1018,6 @@ fn adb_exe_name() -> &'static str {
     } else {
         "adb"
     }
-}
-
-fn platform_tools_url() -> Result<&'static str> {
-    if cfg!(target_os = "macos") {
-        Ok("https://dl.google.com/android/repository/platform-tools-latest-darwin.zip")
-    } else if cfg!(target_os = "windows") {
-        Ok("https://dl.google.com/android/repository/platform-tools-latest-windows.zip")
-    } else if cfg!(target_os = "linux") {
-        Ok("https://dl.google.com/android/repository/platform-tools-latest-linux.zip")
-    } else {
-        Err(InstallerError::Message(
-            "Эта ОС не поддерживается для auto-install platform-tools".to_string(),
-        ))
-    }
-}
-
-fn find_in_path(binary: &str) -> Option<PathBuf> {
-    let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .map(|path| path.join(binary))
-        .find(|path| path.exists())
 }
 
 fn adb_shell_prop(adb: &AdbTarget, prop: &str) -> Result<String> {
@@ -949,4 +1074,26 @@ fn append_output(log: &mut WorkLog, output: CommandOutput) {
 
 fn path_arg(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Вшитый архив собирается вручную из platform-tools, поэтому проверяем, что в нём лежит
+    /// ровно то, что ищет ensure_adb, включая DLL, без которых adb.exe не стартует.
+    #[test]
+    fn adb_bundle_contains_runtime_files() {
+        let archive = ZipArchive::new(Cursor::new(ADB_BUNDLE)).expect("вшитый архив adb читается");
+        let names: Vec<&str> = archive.file_names().collect();
+
+        let mut expected = vec![adb_exe_name()];
+        if cfg!(windows) {
+            expected.extend(["AdbWinApi.dll", "AdbWinUsbApi.dll"]);
+        }
+
+        for file in expected {
+            assert!(names.contains(&file), "в архиве нет {file}: {names:?}");
+        }
+    }
 }
