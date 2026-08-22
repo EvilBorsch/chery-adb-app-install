@@ -112,7 +112,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_device,
             install_apk,
-            grant_permissions,
+            grant_all_permissions,
             list_uninstallable_packages,
             uninstall_package
         ])
@@ -231,7 +231,9 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     };
 
     log.info(format!("Пакет установлен: {package_name}"));
-    grant_permissions_inner(&adb, &package_name, &mut log)?;
+    // Пользователи ГУ не знают, что нужно конкретному приложению, а выдать право руками в
+    // машине негде — поэтому при установке сразу выдаём весь набор, а не только манифестный.
+    grant_all_permissions_inner(&adb, &package_name, &mut log)?;
     if car_management {
         apply_vehicle_management_inner(&adb, &package_name, &mut log)?;
         apply_device_owner_inner(&adb, &package_name, &mut log)?;
@@ -268,7 +270,13 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
 }
 
 #[tauri::command]
-fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
+fn grant_all_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
+    if !is_safe_package_name(&package_name) {
+        return Err(InstallerError::Message(format!(
+            "Некорректное имя пакета: {package_name}"
+        )));
+    }
+
     let adb_path = ensure_adb(&app)?;
     let adb = ensure_device(&adb_path)?;
     if !is_package_installed(&adb, &package_name)? {
@@ -278,7 +286,7 @@ fn grant_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
     }
 
     let mut log = WorkLog::new();
-    grant_permissions_inner(&adb, &package_name, &mut log)?;
+    grant_all_permissions_inner(&adb, &package_name, &mut log)?;
     Ok(log.steps)
 }
 
@@ -325,7 +333,7 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
 // Сколько раз перевыдаём право на фиктивные местоположения, пока установка доезжает
 const MOCK_LOCATION_ATTEMPTS: usize = 4;
 
-fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn grant_manifest_permissions(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     log.info("Выдаю runtime permissions из manifest");
     for permission in requested_permissions(adb, package_name)? {
         let output = run_adb(
@@ -337,33 +345,30 @@ fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLo
         }
     }
 
-    log.info("Выставляю appops");
-    for op in [
-        "MANAGE_EXTERNAL_STORAGE",
-        "LEGACY_STORAGE",
-        "SYSTEM_ALERT_WINDOW",
-        "WRITE_SETTINGS",
-        "REQUEST_INSTALL_PACKAGES",
-        "SCHEDULE_EXACT_ALARM",
-        "ACCESS_NOTIFICATIONS",
-        // Шеринг GPS: без него лаунчер не может отдать машине координаты телефона. На ГУ
-        // выдать это право руками негде — в прошивке нет пункта «приложение для фиктивных
-        // местоположений», а чистая установка (не update) сбрасывает все appops
-        "android:mock_location",
-    ] {
+    Ok(())
+}
+
+/// Отказ appops — это норма: часть операций не существует на конкретной версии Android,
+/// часть неприменима к приложению. Поэтому в журнал пишем только то, что реально выдалось.
+fn set_appops(adb: &AdbTarget, package_name: &str, ops: &[&str], log: &mut WorkLog) -> Result<()> {
+    for &op in ops {
         let output = run_adb(adb, ["shell", "appops", "set", package_name, op, "allow"])?;
         if output.status.success() {
             log.info(format!("appop: {op}=allow"));
         }
     }
 
-    // Право на фиктивные местоположения проверяем отдельно: без него шеринг GPS молча не
-    // работает, а на ГУ выдать его руками негде — в прошивке нет пункта developer options.
-    // Раньше отказ appops не был виден вообще: код возврата adb shell об этом не говорит,
-    // и «нет права» всплывало уже в машине.
-    // Установка большого APK доезжает асинхронно, и appop, выданный на недоустановленный
-    // пакет, теряется молча: adb shell об этом не сообщает никак. Поэтому здесь читаем
-    // фактическое состояние и повторяем выдачу, пока оно не станет allow
+    Ok(())
+}
+
+/// Право на фиктивные местоположения проверяем отдельно: без него шеринг GPS молча не
+/// работает, а на ГУ выдать его руками негде — в прошивке нет пункта developer options.
+/// Раньше отказ appops не был виден вообще: код возврата adb shell об этом не говорит,
+/// и «нет права» всплывало уже в машине.
+/// Установка большого APK доезжает асинхронно, и appop, выданный на недоустановленный
+/// пакет, теряется молча: adb shell об этом не сообщает никак. Поэтому здесь читаем
+/// фактическое состояние и повторяем выдачу, пока оно не станет allow.
+fn verify_mock_location(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
     let mut mock_state = String::new();
     for attempt in 0..MOCK_LOCATION_ATTEMPTS {
         if attempt > 0 {
@@ -390,6 +395,114 @@ fn grant_permissions_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLo
         mock_state.trim()
     ));
 
+    Ok(())
+}
+
+// Полный набор appops для кнопки «Выдать все права»: людям проще выдать сразу всё, чем
+// разбираться, что именно нужно конкретному приложению (Рустор, Стрелка, VPN, HUD speed),
+// а на ГУ соответствующих пунктов в настройках нет.
+const ALL_APPOPS: &[&str] = &[
+    // Хранилище
+    "MANAGE_EXTERNAL_STORAGE",
+    "LEGACY_STORAGE",
+    "READ_EXTERNAL_STORAGE",
+    "WRITE_EXTERNAL_STORAGE",
+    // Поверх других приложений / системные настройки
+    "SYSTEM_ALERT_WINDOW",
+    "WRITE_SETTINGS",
+    // Установка приложений (нужно Рустору и др. сторонним магазинам)
+    "REQUEST_INSTALL_PACKAGES",
+    // Работа в фоне без ограничений
+    "RUN_IN_BACKGROUND",
+    "RUN_ANY_IN_BACKGROUND",
+    "START_FOREGROUND",
+    "INSTANT_APP_START_FOREGROUND",
+    "WAKE_LOCK",
+    // Уведомления / статистика использования
+    "POST_NOTIFICATION",
+    "ACCESS_NOTIFICATIONS",
+    "GET_USAGE_STATS",
+    // Будильники и точное время
+    "SCHEDULE_EXACT_ALARM",
+    "USE_EXACT_ALARM",
+    // Экран
+    "TURN_SCREEN_ON",
+    "PICTURE_IN_PICTURE",
+    // VPN
+    "ACTIVATE_VPN",
+    "ACTIVATE_PLATFORM_VPN",
+    // Геолокация и фиктивные местоположения (шеринг GPS)
+    "COARSE_LOCATION",
+    "FINE_LOCATION",
+    "android:mock_location",
+];
+
+fn grant_all_permissions_inner(
+    adb: &AdbTarget,
+    package_name: &str,
+    log: &mut WorkLog,
+) -> Result<()> {
+    log.info(format!("Выдаю все права: {package_name}"));
+    grant_manifest_permissions(adb, package_name, log)?;
+
+    log.info("Выставляю полный набор appops (фон, установка, VPN, экран, геолокация)");
+    set_appops(adb, package_name, ALL_APPOPS, log)?;
+
+    // Android сам отзывает права у приложений, которыми давно не пользовались. На ГУ это
+    // выглядит так, будто через пару недель всё «сломалось» само — выключаем авто-отзыв.
+    let auto_revoke = run_adb(
+        adb,
+        [
+            "shell",
+            "cmd",
+            "appops",
+            "set",
+            package_name,
+            "AUTO_REVOKE_PERMISSIONS_IF_UNUSED",
+            "ignore",
+        ],
+    )?;
+    if auto_revoke.status.success() {
+        log.info("Авто-отзыв неиспользуемых прав отключён");
+    }
+
+    // Без этого система душит фоновую работу — рвутся VPN и фоновая навигация.
+    log.info("Исключаю из ограничений экономии батареи");
+    let whitelist_package = format!("+{package_name}");
+    run_adb_optional(
+        adb,
+        [
+            "shell",
+            "dumpsys",
+            "deviceidle",
+            "whitelist",
+            whitelist_package.as_str(),
+        ],
+        log,
+    );
+
+    // Доступ к уведомлениям выдаётся не appops, а отдельным списком слушателей, и только
+    // если приложение объявляет NotificationListenerService.
+    let listeners = notification_listener_candidates(adb, package_name)?;
+    if !listeners.is_empty() {
+        log.info("Разрешаю доступ к уведомлениям");
+        for component in listeners {
+            run_adb_optional(
+                adb,
+                [
+                    "shell",
+                    "cmd",
+                    "notification",
+                    "allow_listener",
+                    component.as_str(),
+                ],
+                log,
+            );
+        }
+    }
+
+    verify_mock_location(adb, package_name, log)?;
+    log.info(format!("Все права выданы: {package_name}"));
     Ok(())
 }
 

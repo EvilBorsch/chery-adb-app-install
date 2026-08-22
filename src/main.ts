@@ -44,6 +44,17 @@ app.innerHTML = `
       <div class="status" id="deviceStatus">Проверка ADB...</div>
     </header>
 
+    <section class="notice">
+      <strong>При установке приложению сразу выдаются ВСЕ права.</strong>
+      Доступ к файлам, работа поверх других окон, установка приложений, работа в фоне без
+      ограничений экономии батареи, VPN, уведомления, геолокация и фиктивные местоположения
+      (шеринг GPS). В машине выдать их через настройки нельзя, поэтому они выдаются пакетом,
+      и Android не отзовёт их со временем.
+      <br />
+      Если приложение уже установлено и ему не хватает прав — выберите его в списке ниже и
+      нажмите «Выдать все права».
+    </section>
+
     <section class="toolbar">
       <button id="checkDevice" type="button">Проверить ГУ</button>
       <button id="pickApk" type="button">Выбрать APK</button>
@@ -60,19 +71,20 @@ app.innerHTML = `
     </section>
 
     <section class="actions">
-      <button id="installNormalApk" class="primary" type="button" disabled>Установить обычное приложение</button>
+      <button id="installNormalApk" class="primary" type="button" disabled>Установить приложение и выдать все права</button>
       <button id="installCarApk" class="danger" type="button" disabled>Установить приложение с правом управления авто (вам это скорее всего не надо)</button>
     </section>
 
     <section class="app-manager">
       <div class="app-manager-header">
-        <h2>Удаление приложения</h2>
+        <h2>Управление приложениями</h2>
         <button id="loadApps" type="button">Обновить список</button>
       </div>
       <div class="app-manager-controls">
         <select id="packageSelect" aria-label="Выбор приложения">
           <option value="">Список не загружен</option>
         </select>
+        <button id="grantAllApp" class="primary" type="button" disabled>Выдать все права</button>
         <button id="uninstallApp" class="danger" type="button" disabled>Удалить выбранное</button>
       </div>
     </section>
@@ -89,6 +101,7 @@ const pickApkButton = document.querySelector<HTMLButtonElement>("#pickApk")!;
 const installNormalApkButton = document.querySelector<HTMLButtonElement>("#installNormalApk")!;
 const installCarApkButton = document.querySelector<HTMLButtonElement>("#installCarApk")!;
 const loadAppsButton = document.querySelector<HTMLButtonElement>("#loadApps")!;
+const grantAllAppButton = document.querySelector<HTMLButtonElement>("#grantAllApp")!;
 const uninstallAppButton = document.querySelector<HTMLButtonElement>("#uninstallApp")!;
 const packageSelect = document.querySelector<HTMLSelectElement>("#packageSelect")!;
 const dropZone = document.querySelector<HTMLElement>("#dropZone")!;
@@ -103,6 +116,7 @@ function render() {
   installNormalApkButton.disabled = busy || !selectedApk;
   installCarApkButton.disabled = busy || !selectedApk;
   loadAppsButton.disabled = busy;
+  grantAllAppButton.disabled = busy || !selectedPackage;
   uninstallAppButton.disabled = busy || !selectedPackage;
   dropZone.classList.toggle("busy", busy);
   renderPackageOptions();
@@ -174,6 +188,24 @@ loadAppsButton.addEventListener("click", () => {
 packageSelect.addEventListener("change", () => {
   selectedPackage = packageSelect.value || null;
   render();
+});
+
+grantAllAppButton.addEventListener("click", () => {
+  const packageName = selectedPackage;
+  if (!packageName) {
+    return;
+  }
+
+  if (!window.confirm(`Выдать все права приложению ${packageName}?`)) {
+    return;
+  }
+
+  runBusy(async () => {
+    addStep("info", `Выдаю все права: ${packageName}`);
+    const result = await invoke<Step[]>("grant_all_permissions", { packageName });
+    addSteps(result);
+    addStep("info", `Готово: права выданы для ${packageName}`);
+  });
 });
 
 uninstallAppButton.addEventListener("click", () => {

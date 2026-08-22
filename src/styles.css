@@ -105,6 +105,16 @@ h1 {
   color: #74520e;
 }
 
+.notice {
+  background: #eef5ff;
+  border: 1px solid #b9d1ff;
+  border-radius: 8px;
+  color: #24406e;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 14px 16px;
+}
+
 .toolbar,
 .actions {
   display: flex;
