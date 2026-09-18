@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">InstallClicker</string>
+    <string name="service_label">InstallClicker — автоклик «Установить»</string>
+    <string name="service_description">Находит в окне системного установщика кнопку «Установить» и нажимает её системным действием, когда обычное касание по экрану не срабатывает.</string>
+</resources>

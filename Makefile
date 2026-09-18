@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: help install-deps dev build check test clean tauri-info vendor-adb
+.PHONY: help install-deps dev build check test clean tauri-info vendor-adb installclicker-apk
 
 help:
 	@echo "Targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  make clean         Remove build outputs"
 	@echo "  make tauri-info    Print Tauri environment info"
 	@echo "  make vendor-adb    Refresh bundled adb from Android platform-tools"
+	@echo "  make installclicker-apk  Build InstallClicker APK (needs Android SDK)"
 
 install-deps:
 	npm install
@@ -49,8 +50,17 @@ vendor-adb:
 	$$tmp/darwin/platform-tools/adb --version; \
 	rm -rf $$tmp
 
+# Сборка APK автокликера «Установить». Нужен Android SDK: ANDROID_HOME или sdk.dir.
+installclicker-apk:
+	@set -e; \
+	sdk=$${ANDROID_HOME:-$$ANDROID_SDK_ROOT}; \
+	if [ -z "$$sdk" ]; then echo "set ANDROID_HOME to your Android SDK"; exit 1; fi; \
+	echo "sdk.dir=$$sdk" > installclicker/local.properties; \
+	cd installclicker && gradle --no-daemon :app:assembleRelease; \
+	echo "APK: installclicker/app/build/outputs/apk/release/app-release.apk"
+
 clean:
-	rm -rf dist node_modules src-tauri/target
+	rm -rf dist node_modules src-tauri/target installclicker/build installclicker/app/build
 
 tauri-info:
 	npx tauri info

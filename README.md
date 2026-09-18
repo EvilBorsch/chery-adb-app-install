@@ -51,6 +51,7 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
     adb-linux.zip              вшиваемый adb под Linux x86_64
   src-tauri/resources/
     localinstall.apk           helper установки через PackageInstaller.Session
+  installclicker/              Android-приложение: автоклик кнопки «Установить» на ГУ
 ```
 
 
@@ -246,3 +247,10 @@ adb shell appops get <package.name>
 ```text
 instuction.md
 ```
+
+## InstallClicker
+
+Если на ГУ кнопка «Установить» в штатном окне установки не реагирует на палец, в папке
+`installclicker/` лежит отдельное Android-приложение: сервис специальных возможностей
+находит эту кнопку и нажимает её системным действием, которое не отбрасывается фильтром
+касаний. Подробности и установка — в `installclicker/README.md`.

@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Релиз подписывается ключом из keystore.properties, если он есть. Файла нет —
+// берём debug-ключ, чтобы собранный APK всё равно ставился на ГУ.
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
+android {
+    namespace 'com.evilborsch.installclicker'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.evilborsch.installclicker"
+        minSdk 21
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig keystorePropsFile.exists()
+                    ? signingConfigs.release
+                    : signingConfigs.debug
+        }
+    }
+
+    lint {
+        // Релизная сборка не должна зависеть от загрузки lint-зависимостей из сети.
+        checkReleaseBuilds false
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // Приложение намеренно без AndroidX: меньше APK и никаких зависимостей при сборке.
+}
