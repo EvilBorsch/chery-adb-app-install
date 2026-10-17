@@ -261,6 +261,7 @@ function installSelectedApk(carManagement: boolean) {
   runBusy(async () => {
     const mode = carManagement ? "с правом управления авто" : "обычного приложения";
     addStep("info", `Начинаю установку APK в режиме: ${mode}`);
+    addStep("info", "После копирования APK ожидание ответа Android может занять до 120 секунд.");
     const result = await invoke<InstallResult>("install_apk", {
       apkPath: selectedApk,
       carManagement

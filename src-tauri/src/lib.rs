@@ -10,6 +10,13 @@ use tauri::{AppHandle, Manager};
 use thiserror::Error;
 use zip::ZipArchive;
 
+mod install_diagnostics;
+mod install_wait;
+
+use install_diagnostics::{failure_summary, helper_package, helper_succeeded};
+use install_wait::wait_for_installation;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 #[derive(Debug, Error)]
 enum InstallerError {
     #[error("{0}")]
@@ -38,6 +45,8 @@ const AXML_START_ELEMENT: usize = 0x0102;
 // adb вшит в бинарь: приложение должно работать сразу, без скачивания platform-tools.
 // Версия входит в путь распаковки, чтобы обновление приложения не оставляло старый adb.
 const ADB_VERSION: &str = "37.0.1";
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+const INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "macos")]
 const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-macos.zip");
@@ -145,8 +154,32 @@ fn check_device(app: AppHandle) -> Result<DeviceInfo> {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result<InstallResult> {
+    let mut log = WorkLog::new();
+    match install_apk_inner(&app, apk_path, car_management, &mut log) {
+        Ok(package_name) => Ok(InstallResult {
+            package_name,
+            steps: log.steps,
+        }),
+        Err(error) => {
+            let steps = log
+                .steps
+                .iter()
+                .map(|step| step.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(InstallerError::Message(format!("{steps}\nОшибка: {error}")))
+        }
+    }
+}
+
+fn install_apk_inner(
+    app: &AppHandle,
+    apk_path: String,
+    car_management: bool,
+    log: &mut WorkLog,
+) -> Result<String> {
     let apk_path = PathBuf::from(apk_path);
     if !apk_path.is_file() {
         return Err(InstallerError::Message(format!(
@@ -155,11 +188,10 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
         )));
     }
 
-    let mut log = WorkLog::new();
-    let adb_path = ensure_adb(&app)?;
+    let adb_path = ensure_adb(app)?;
     let adb = ensure_device(&adb_path)?;
     if car_management {
-        apply_vehicle_preinstall(&adb, &mut log);
+        apply_vehicle_preinstall(&adb, log);
     }
 
     let package_before = list_packages(&adb)?;
@@ -167,7 +199,7 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
 
     let remote_apk = "/data/local/tmp/desaysv-install-target.apk";
     let remote_helper = "/data/local/tmp/desaysv-localinstall.apk";
-    let helper = resource_localinstall(&app)?;
+    let helper = resource_localinstall(app)?;
 
     log.info("Копирую APK на устройство");
     run_adb_checked(&adb, ["push", path_arg(&apk_path).as_str(), remote_apk])?;
@@ -182,67 +214,90 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
     if let Some(package) = package_hint.as_deref() {
         if is_package_installed(&adb, package)? {
             log.info(format!("Снимаю установленную версию {package}"));
-            run_adb_optional(&adb, ["shell", "pm", "uninstall", package], &mut log);
+            let output = run_adb_checked(&adb, ["shell", "pm", "uninstall", package])?;
+            if !output.stdout.lines().any(|line| line.trim() == "Success") {
+                return Err(InstallerError::Message(format!(
+                    "Не удалось удалить установленную версию {package}.\n{}{}",
+                    output.stdout, output.stderr
+                )));
+            }
+            append_output(log, output);
         }
     }
 
     log.info("Устанавливаю APK через PackageInstaller.Session");
-    let install_cmd = format!(
-        "CLASSPATH={remote_helper} /system/bin/app_process /system/bin LocalInstall {remote_apk}"
+    let marker = format!(
+        "desaysv-install-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
     );
-    let output = run_adb_checked(&adb, ["shell", install_cmd.as_str()])?;
-    append_output(&mut log, output);
+    run_adb_optional(
+        &adb,
+        ["shell", "log", "-t", "DesaySVInstaller", marker.as_str()],
+        log,
+    );
+    let install_cmd = format!(
+        "CLASSPATH={remote_helper} /system/bin/app_process /system/bin LocalInstall {remote_apk} {}",
+        INSTALL_TIMEOUT.as_secs()
+    );
+    let started = Instant::now();
+    let output = run_adb(&adb, ["shell", install_cmd.as_str()])?;
+    let failure = (!output.status.success() || !helper_succeeded(&output.stdout)).then(|| {
+        failure_summary(
+            &output.stdout,
+            output.status.code(),
+            INSTALL_TIMEOUT.as_secs(),
+        )
+    });
+    let package_hint = helper_package(&output.stdout)
+        .filter(|package| is_safe_package_name(package))
+        .map(ToOwned::to_owned)
+        .or(package_hint);
+    append_output(log, output);
+    if let Some(reason) = failure {
+        let diagnostics = collect_install_diagnostics(&adb, &marker);
+        return Err(InstallerError::Message(format!("{reason}\n{diagnostics}")));
+    }
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    let package_name = match package_hint {
-        Some(package) if is_package_installed(&adb, &package)? => package,
-        // PackageInstaller отдаёт результат асинхронно, helper его не дожидается,
-        // поэтому причину отказа забираем из лога PackageManager.
-        Some(package) => {
-            let reason = run_adb(
-                &adb,
-                [
-                    "shell",
-                    "logcat",
-                    "-d",
-                    "-t",
-                    "600",
-                    "-s",
-                    "PackageManager:W",
-                ],
-            )
-            .ok()
-            .and_then(|output| {
-                output
-                    .stdout
-                    .lines()
-                    .rev()
-                    .find(|line| line.contains(package.as_str()))
-                    .map(str::trim)
-                    .map(ToOwned::to_owned)
-            })
-            .unwrap_or_else(|| "причина не найдена в логе PackageManager".to_string());
-            return Err(InstallerError::Message(format!(
-                "Установка {package} не завершилась: {reason}"
-            )));
-        }
-        None => detect_new_package(&adb, &package_before)?,
-    };
+    // Даже после успешного callback пакет должен появиться в списке PackageManager.
+    let package_name = wait_for_installation(
+        INSTALL_TIMEOUT.saturating_sub(started.elapsed()),
+        INSTALL_POLL_INTERVAL,
+        || -> Result<Option<String>> {
+            match package_hint.as_deref() {
+                Some(package) => {
+                    Ok(is_package_installed(&adb, package)?.then(|| package.to_string()))
+                }
+                None => Ok(list_packages(&adb)?
+                    .into_iter()
+                    .find(|package| !package_before.contains(package))),
+            }
+        },
+    )?;
+    let package_name = package_name.ok_or_else(|| {
+        InstallerError::Message(format!(
+            "Android сообщил об успешной установке {}, но пакет не появился в списке за {} секунд.\n{}",
+            package_hint.as_deref().unwrap_or("APK"),
+            INSTALL_TIMEOUT.as_secs(),
+            collect_install_diagnostics(&adb, &marker)
+        ))
+    })?;
 
     log.info(format!("Пакет установлен: {package_name}"));
     // Пользователи ГУ не знают, что нужно конкретному приложению, а выдать право руками в
     // машине негде — поэтому при установке сразу выдаём весь набор, а не только манифестный.
-    grant_all_permissions_inner(&adb, &package_name, &mut log)?;
+    grant_all_permissions_inner(&adb, &package_name, log)?;
     if car_management {
-        apply_vehicle_management_inner(&adb, &package_name, &mut log)?;
-        apply_device_owner_inner(&adb, &package_name, &mut log)?;
+        apply_vehicle_management_inner(&adb, &package_name, log)?;
+        apply_device_owner_inner(&adb, &package_name, log)?;
     }
 
     run_adb_optional(
         &adb,
         ["shell", "am", "force-stop", package_name.as_str()],
-        &mut log,
+        log,
     );
     run_adb_optional(
         &adb,
@@ -255,18 +310,11 @@ fn install_apk(app: AppHandle, apk_path: String, car_management: bool) -> Result
             "android.intent.category.LAUNCHER",
             "1",
         ],
-        &mut log,
+        log,
     );
-    run_adb_optional(
-        &adb,
-        ["shell", "rm", "-f", remote_apk, remote_helper],
-        &mut log,
-    );
+    run_adb_optional(&adb, ["shell", "rm", "-f", remote_apk, remote_helper], log);
 
-    Ok(InstallResult {
-        package_name,
-        steps: log.steps,
-    })
+    Ok(package_name)
 }
 
 #[tauri::command]
@@ -333,7 +381,11 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
 // Сколько раз перевыдаём право на фиктивные местоположения, пока установка доезжает
 const MOCK_LOCATION_ATTEMPTS: usize = 4;
 
-fn grant_manifest_permissions(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn grant_manifest_permissions(
+    adb: &AdbTarget,
+    package_name: &str,
+    log: &mut WorkLog,
+) -> Result<()> {
     log.info("Выдаю runtime permissions из manifest");
     for permission in requested_permissions(adb, package_name)? {
         let output = run_adb(
@@ -375,12 +427,26 @@ fn verify_mock_location(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) 
             std::thread::sleep(std::time::Duration::from_secs(2));
             run_adb(
                 adb,
-                ["shell", "appops", "set", package_name, "android:mock_location", "allow"],
+                [
+                    "shell",
+                    "appops",
+                    "set",
+                    package_name,
+                    "android:mock_location",
+                    "allow",
+                ],
             )?;
         }
         mock_state = run_adb(
             adb,
-            ["shell", "cmd", "appops", "get", package_name, "android:mock_location"],
+            [
+                "shell",
+                "cmd",
+                "appops",
+                "get",
+                package_name,
+                "android:mock_location",
+            ],
         )?
         .stdout;
         if mock_state.contains("allow") {
@@ -511,7 +577,11 @@ fn apply_vehicle_preinstall(adb: &AdbTarget, log: &mut WorkLog) {
     run_adb_optional(adb, ["shell", "setprop", "persist.sys.sv.isl", "true"], log);
 }
 
-fn apply_vehicle_management_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkLog) -> Result<()> {
+fn apply_vehicle_management_inner(
+    adb: &AdbTarget,
+    package_name: &str,
+    log: &mut WorkLog,
+) -> Result<()> {
     log.info("Applying vehicle-management compatibility commands");
     apply_vehicle_preinstall(adb, log);
 
@@ -816,9 +886,7 @@ fn resolve_head_unit(adb_path: &Path) -> Result<AdbTarget> {
     }
 
     let selected = select_head_unit(&online).ok_or_else(|| {
-        InstallerError::Message(
-            "ГУ не найдено среди подключенных ADB-устройств".to_string(),
-        )
+        InstallerError::Message("ГУ не найдено среди подключенных ADB-устройств".to_string())
     })?;
 
     Ok(AdbTarget {
@@ -895,7 +963,12 @@ fn select_head_unit<'a>(devices: &[&'a ListedDevice]) -> Option<&'a ListedDevice
                 .filter(|device| is_truncated_hex_serial(&device.serial))
                 .max_by_key(|device| head_unit_score(device))
         })
-        .or_else(|| devices.iter().copied().max_by_key(|device| head_unit_score(device)))
+        .or_else(|| {
+            devices
+                .iter()
+                .copied()
+                .max_by_key(|device| head_unit_score(device))
+        })
 }
 
 fn head_unit_score(device: &ListedDevice) -> i32 {
@@ -979,7 +1052,7 @@ fn list_packages(adb: &AdbTarget) -> Result<Vec<String>> {
 }
 
 fn is_package_installed(adb: &AdbTarget, package_name: &str) -> Result<bool> {
-    let output = run_adb(adb, ["shell", "pm", "list", "packages", package_name])?;
+    let output = run_adb_checked(adb, ["shell", "pm", "list", "packages", package_name])?;
     Ok(output
         .stdout
         .lines()
@@ -994,16 +1067,75 @@ fn is_safe_package_name(package_name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
 }
 
-fn detect_new_package(adb: &AdbTarget, before: &[String]) -> Result<String> {
-    let after = list_packages(adb)?;
-    after
-        .into_iter()
-        .find(|package| !before.contains(package))
-        .ok_or_else(|| {
-            InstallerError::Message(
-                "APK установлен, но имя пакета не удалось определить автоматически".to_string(),
-            )
-        })
+fn collect_install_diagnostics(adb: &AdbTarget, marker: &str) -> String {
+    let mut sections = Vec::new();
+    for (label, args) in [
+        ("Модель ГУ", vec!["shell", "getprop", "ro.product.model"]),
+        (
+            "Android",
+            vec!["shell", "getprop", "ro.build.version.release"],
+        ),
+        ("SDK", vec!["shell", "getprop", "ro.build.version.sdk"]),
+        (
+            "Архитектуры",
+            vec!["shell", "getprop", "ro.product.cpu.abilist"],
+        ),
+        ("Свободное место /data", vec!["shell", "df", "-k", "/data"]),
+    ] {
+        let text = match run_adb(adb, args) {
+            Ok(output) => format!("{}{}", output.stdout, output.stderr),
+            Err(error) => format!("Не удалось прочитать: {error}"),
+        };
+        sections.push(format!("{label}: {}", text.trim()));
+    }
+    match run_adb(
+        adb,
+        [
+            "shell",
+            "logcat",
+            "-b",
+            "all",
+            "-d",
+            "-t",
+            "2000",
+            "-v",
+            "threadtime",
+        ],
+    ) {
+        Ok(output) => {
+            let current = output
+                .stdout
+                .rsplit_once(marker)
+                .map(|(_, current)| current);
+            let source = current.unwrap_or(&output.stdout);
+            let relevant: Vec<&str> = source
+                .lines()
+                .filter(|line| {
+                    [
+                        "PackageManager",
+                        "PackageInstaller",
+                        "LocalInstall",
+                        "installd",
+                        "dex2oat",
+                        "INSTALL_FAILED",
+                        "Exception",
+                        "avc:",
+                    ]
+                    .iter()
+                    .any(|tag| line.contains(tag))
+                })
+                .collect();
+            let start = relevant.len().saturating_sub(80);
+            sections.push(format!(
+                "Системный журнал ({}):\n{}\n{}",
+                if current.is_some() { "текущая попытка" } else { "маркер попытки недоступен; последние сообщения могут относиться к прошлым операциям" },
+                if relevant.is_empty() { "Android не записал подходящих сообщений в доступный журнал.".to_string() } else { relevant[start..].join("\n") },
+                output.stderr.trim()
+            ));
+        }
+        Err(error) => sections.push(format!("Не удалось прочитать logcat: {error}")),
+    }
+    format!("Диагностика ГУ:\n{}", sections.join("\n"))
 }
 
 /// Читает package из бинарного AndroidManifest.xml внутри APK: aapt в системе может
@@ -1120,9 +1252,9 @@ fn resource_localinstall(app: &AppHandle) -> Result<PathBuf> {
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf> {
-    app.path().app_data_dir().map_err(|err| {
-        InstallerError::Message(format!("Не удалось получить app data dir: {err}"))
-    })
+    app.path()
+        .app_data_dir()
+        .map_err(|err| InstallerError::Message(format!("Не удалось получить app data dir: {err}")))
 }
 
 fn adb_exe_name() -> &'static str {

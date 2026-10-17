@@ -15,6 +15,10 @@ APK устанавливается не shell-командой установк�
 4. Записывает APK в session как `base.apk`.
 5. Делает `fsync`.
 6. Коммитит session через собственный `IntentSender` на базе `IIntentSender.Stub`.
+7. Ждёт callback до 120 секунд и выводит `LOCALINSTALL_STATUS`,
+   `LOCALINSTALL_LEGACY_STATUS`, `LOCALINSTALL_MESSAGE` и имя пакета.
+   Код выхода 0 означает подтверждённый успех, 1 — отказ/исключение,
+   2 — тайм-аут. Helper не завершается сразу после `commit`, чтобы не потерять callback.
 
 Именно такой тип установки сработал на ГУ.
 

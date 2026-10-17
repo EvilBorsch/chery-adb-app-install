@@ -13,6 +13,13 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
 4. Перетащите APK в окно или выберите файл кнопкой.
 5. Нажмите `Установить приложение и выдать все права`.
 
+После копирования APK приложение ждёт ответ Android об установке до **120 секунд**.
+При быстром ответе выдача прав начинается сразу. При отказе журнал сохраняет пройденные
+шаги, исходный код `INSTALL_FAILED_*` / `INSTALL_PARSE_FAILED_*`, сообщение Android,
+статусы PackageInstaller, сведения о ГУ, свободное место и доступные системные логи.
+Тайм-аут показывается отдельно: он означает, что Android не вернул результат вовремя,
+и установка на ГУ ещё может продолжаться.
+
 ### Права
 
 При установке приложению сразу выдаются **все** права — на ГУ выдать их через настройки
@@ -90,8 +97,8 @@ src-tauri/target/release/bundle/
 для этого не нужен. Достаточно поставить тег:
 
 ```bash
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.3.1
+git push origin v1.3.1
 ```
 
 Workflow соберёт Windows (`.exe`/`.msi`) и macOS (Apple Silicon и Intel `.dmg`) и опубликует
@@ -99,6 +106,15 @@ Workflow соберёт Windows (`.exe`/`.msi`) и macOS (Apple Silicon и Intel
 `src-tauri/Cargo.toml` и `src-tauri/tauri.conf.json`.
 
 Каждый push в `main` дополнительно проверяется workflow `ci.yml` (`cargo check` + `cargo test`).
+
+Исходники helper находятся в `helper/`. Для пересборки встроенного
+`src-tauri/resources/localinstall.apk` на Windows нужны JDK 17+ и Android SDK:
+
+```powershell
+.\helper\build.ps1 -AndroidSdk D:\android-sdk
+```
+
+Интерфейсы в `helper/stubs/` используются только при компиляции; в DEX они не включаются.
 
 ## Makefile
 
