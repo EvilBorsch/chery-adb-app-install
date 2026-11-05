@@ -14,7 +14,17 @@ type DeviceInfo = {
   serial: string | null;
   model: string | null;
   android: string | null;
+  message: string | null;
 };
+
+type PickedApk = {
+  path: string;
+  name: string;
+  size: number;
+};
+
+// На телефоне ГУ подключается по USB через OTG, а APK выбирается в памяти телефона.
+const isAndroid = /android/i.test(navigator.userAgent);
 
 type InstallResult = {
   package_name: string;
@@ -28,6 +38,7 @@ if (!app) {
 }
 
 let selectedApk: string | null = null;
+let selectedApkLabel: string | null = null;
 let selectedPackage: string | null = null;
 let uninstallablePackages: string[] = [];
 let busy = false;
@@ -39,7 +50,7 @@ app.innerHTML = `
     <header class="topbar">
       <div>
         <h1>DesaySV APK Installer</h1>
-        <p>Установка APK на Tenet T8 / Chery DesaySV через ADB</p>
+        <p>${isAndroid ? "Установка APK на Tenet T8 / Chery DesaySV с телефона по USB" : "Установка APK на Tenet T8 / Chery DesaySV через ADB"}</p>
       </div>
       <div class="status" id="deviceStatus">Проверка ADB...</div>
     </header>
@@ -55,6 +66,15 @@ app.innerHTML = `
       нажмите «Выдать все права».
     </section>
 
+    ${isAndroid ? `
+    <section class="notice">
+      <strong>Подключение ГУ к телефону.</strong>
+      Кабель USB A–A от ГУ и переходник OTG USB A → USB-C в телефон — тот же кабель, что для
+      компьютера. Обычный кабель от зарядки USB-C → USB-A не подойдёт: с ним телефон не станет
+      ведущим. При первом подключении разрешите телефону доступ к USB-устройству, а на экране ГУ —
+      отладку по USB («Всегда разрешать»).
+    </section>` : ""}
+
     <section class="toolbar">
       <button id="checkDevice" type="button">Проверить ГУ</button>
       <button id="pickApk" type="button">Выбрать APK</button>
@@ -65,8 +85,8 @@ app.innerHTML = `
     <section class="drop-zone" id="dropZone">
       <div class="drop-icon">APK</div>
       <div>
-        <h2>Перетащите APK сюда</h2>
-        <p id="selectedApkText">или нажмите «Выбрать APK»</p>
+        <h2>${isAndroid ? "Выберите APK" : "Перетащите APK сюда"}</h2>
+        <p id="selectedApkText"></p>
       </div>
     </section>
 
@@ -121,16 +141,17 @@ function render() {
   dropZone.classList.toggle("busy", busy);
   renderPackageOptions();
 
-  selectedApkText.textContent = selectedApk ?? "или нажмите «Выбрать APK»";
+  selectedApkText.textContent =
+    selectedApkLabel ?? (isAndroid ? "Нажмите, чтобы выбрать файл в памяти телефона" : "или нажмите «Выбрать APK»");
   deviceStatus.textContent = device?.connected ? "ГУ подключено" : "ADB не подключен";
   deviceStatus.className = `status ${device?.connected ? "ok" : "warn"}`;
 
-  const adb = device?.adb_path ?? "не найден";
+  const adb = device?.adb_path ?? (isAndroid ? "нет" : "не найден");
   const serial = device?.serial ?? "не определен";
   const model = device?.model ?? "не определена";
   const android = device?.android ?? "не определен";
   devicePanel.innerHTML = `
-    <div><span>ADB</span><strong>${escapeHtml(adb)}</strong></div>
+    <div><span>${isAndroid ? "Подключение" : "ADB"}</span><strong>${escapeHtml(adb)}</strong></div>
     <div><span>Серийный номер</span><strong>${escapeHtml(serial)}</strong></div>
     <div><span>Модель</span><strong>${escapeHtml(model)}</strong></div>
     <div><span>Android</span><strong>${escapeHtml(android)}</strong></div>
@@ -169,8 +190,14 @@ async function runBusy<T>(action: () => Promise<T>): Promise<T | null> {
 async function refreshDevice() {
   await runBusy(async () => {
     addStep("info", "Проверяю ADB и подключенное устройство");
+    if (isAndroid) {
+      addStep("info", "Если на экране ГУ появится запрос отладки по USB — нажмите «Разрешить».");
+    }
     device = await invoke<DeviceInfo>("check_device");
     addStep(device.connected ? "info" : "warn", device.connected ? "ГУ найдено" : "ГУ не найдено");
+    if (!device.connected && device.message) {
+      addStep("warn", device.message);
+    }
   });
 }
 
@@ -230,6 +257,16 @@ uninstallAppButton.addEventListener("click", () => {
 
 pickApkButton.addEventListener("click", () => {
   runBusy(async () => {
+    if (isAndroid) {
+      const picked = await invoke<PickedApk | null>("pick_apk_mobile");
+      if (picked) {
+        selectedApk = picked.path;
+        selectedApkLabel = `${picked.name} (${formatSize(picked.size)})`;
+        addStep("info", `Выбран APK: ${picked.name}`);
+      }
+      return;
+    }
+
     const picked = await open({
       multiple: false,
       filters: [{ name: "Android APK", extensions: ["apk"] }]
@@ -237,6 +274,7 @@ pickApkButton.addEventListener("click", () => {
 
     if (typeof picked === "string") {
       selectedApk = picked;
+      selectedApkLabel = picked;
       addStep("info", `Выбран APK: ${picked}`);
     }
   });
@@ -274,7 +312,7 @@ function installSelectedApk(carManagement: boolean) {
 
 dropZone.addEventListener("click", () => pickApkButton.click());
 
-getCurrentWebview().onDragDropEvent((event) => {
+if (!isAndroid) getCurrentWebview().onDragDropEvent((event) => {
   if (event.payload.type === "over") {
     dropZone.classList.add("over");
   } else if (event.payload.type === "drop") {
@@ -282,6 +320,7 @@ getCurrentWebview().onDragDropEvent((event) => {
     const apk = event.payload.paths.find((path) => path.toLowerCase().endsWith(".apk"));
     if (apk) {
       selectedApk = apk;
+      selectedApkLabel = apk;
       addStep("info", `APK принят: ${apk}`);
       render();
     } else {
@@ -292,13 +331,21 @@ getCurrentWebview().onDragDropEvent((event) => {
   }
 });
 
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} КБ`;
+}
+
 function escapeHtml(value: string): string {
   return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    // replace с /g, а не replaceAll: старый Android WebView (Chrome < 85) replaceAll не знает.
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
 
 function renderPackageOptions() {
@@ -319,5 +366,6 @@ function renderPackageOptions() {
     .join("");
 }
 
+document.body.classList.toggle("mobile", isAndroid);
 refreshDevice();
 render();

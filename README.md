@@ -1,6 +1,7 @@
 # Chery APK Install
 
-Tauri 2 desktop-приложение для установки APK на Tenet T8 / Chery head unit.
+Tauri 2 приложение для установки APK на Tenet T8 / Chery head unit: Windows, macOS, Linux
+и Android-телефон (ГУ подключается к телефону кабелем через OTG).
 
 
 `adb` вшит в приложение — ничего скачивать и устанавливать вручную не нужно.
@@ -19,6 +20,23 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
 статусы PackageInstaller, сведения о ГУ, свободное место и доступные системные логи.
 Тайм-аут показывается отдельно: он означает, что Android не вернул результат вовремя,
 и установка на ГУ ещё может продолжаться.
+
+### С Android-телефона
+
+Android-версия делает то же самое, что ПК-установщик: тот же helper установки, тот же набор
+прав, тот же режим «с правом управления авто». Отличается только способ связи с ГУ: телефон сам
+выступает USB-хостом и говорит с ГУ по протоколу ADB, как компьютер.
+
+1. Подключите ГУ к телефону тем же кабелем USB A–A, что и к компьютеру, через переходник
+   OTG USB A (мама) → USB-C (папа). Обычный кабель от зарядки USB-C → USB-A не подойдёт:
+   с ним телефон считает себя подключённым к компьютеру и не становится хостом.
+2. Откройте приложение. На вопрос Android о доступе к USB-устройству ответьте «Разрешить»
+   (с галочкой «Всегда» вопрос больше не появится).
+3. При первом подключении на экране ГУ появится запрос «Разрешить отладку по USB?» —
+   отметьте «Всегда разрешать» и нажмите «Разрешить». Затем снова нажмите `Проверить ГУ`.
+4. `Выбрать APK` открывает выбор файла в памяти телефона, дальше всё как на компьютере.
+
+Нужен Android 8.0 или новее.
 
 ### Права
 
@@ -52,6 +70,9 @@ Tauri 2 desktop-приложение для установки APK на Tenet T8
   package-lock.json            lockfile npm-зависимостей
   src/                         web UI
   src-tauri/                   Rust backend Tauri 2
+  src-tauri/src/transport_desktop.rs  связь с ГУ через вшитый adb (Windows/macOS/Linux)
+  src-tauri/src/transport_android.rs  связь с ГУ по USB OTG (Android)
+  src-tauri/gen/android/       Android-проект; ADB-клиент по USB — app/src/main/java/.../adb/
   src-tauri/binaries/
     adb-macos.zip              вшиваемый adb под macOS (universal x86_64 + arm64)
     adb-windows.zip            вшиваемый adb.exe под Windows вместе с его DLL
@@ -101,8 +122,8 @@ git tag v1.3.1
 git push origin v1.3.1
 ```
 
-Workflow соберёт Windows (`.exe`/`.msi`) и macOS (Apple Silicon и Intel `.dmg`) и опубликует
-их в релизе с этим тегом. Версию перед тегом нужно поднять в трёх местах: `package.json`,
+Workflow соберёт Windows (`.exe`/`.msi`), macOS (Apple Silicon и Intel `.dmg`) и, если заданы
+секреты подписи, Android (`.apk`) и опубликует их в релизе с этим тегом. Версию перед тегом нужно поднять в трёх местах: `package.json`,
 `src-tauri/Cargo.toml` и `src-tauri/tauri.conf.json`.
 
 Каждый push в `main` дополнительно проверяется workflow `ci.yml` (`cargo check` + `cargo test`).
@@ -115,6 +136,57 @@ Workflow соберёт Windows (`.exe`/`.msi`) и macOS (Apple Silicon и Intel
 ```
 
 Интерфейсы в `helper/stubs/` используются только при компиляции; в DEX они не включаются.
+
+## Android
+
+Требования: JDK 17, Android SDK с NDK, Rust-таргеты Android:
+
+```bash
+rustup target add aarch64-linux-android armv7-linux-androideabi
+```
+
+Сборка (переменные окружения указывают на SDK и NDK):
+
+```powershell
+$env:ANDROID_HOME = 'D:\android-sdk'
+$env:NDK_HOME = 'D:\android-sdk\ndk\28.2.13676358'
+npx tauri android build --apk --target aarch64 --target armv7
+```
+
+Готовый APK:
+
+```text
+src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+```
+
+На Windows Tauri кладёт собранную Rust-библиотеку в `jniLibs` символической ссылкой, поэтому
+нужен включённый «Режим разработчика» (Параметры → Система → Для разработчиков). Без него сборка
+падает на шаге `symlinking lib` — тогда можно скопировать
+`src-tauri/target/<target>/release/libdesaysv_apk_installer_lib.so` в
+`src-tauri/gen/android/app/src/main/jniLibs/<abi>/` вручную и запустить Gradle:
+
+```powershell
+cd src-tauri\gen\android
+.\gradlew.bat assembleUniversalRelease -x rustBuildUniversalRelease "-PabiList=arm64-v8a,armeabi-v7a" "-ParchList=arm64,arm" "-PtargetList=aarch64,armv7"
+```
+
+Подпись release-сборки берётся из `src-tauri/gen/android/keystore.properties` (в git не
+попадает):
+
+```properties
+storeFile=C:/путь/к/release.jks
+password=пароль
+keyAlias=desaysv
+```
+
+Ключ нужно хранить: обновление встаёт поверх установленного приложения только с той же
+подписью. В GitHub Actions тот же ключ задаётся секретами `ANDROID_KEYSTORE_BASE64`
+(`base64` от `.jks`), `ANDROID_KEYSTORE_PASSWORD` и `ANDROID_KEY_ALIAS` — тогда релиз по тегу
+дополнительно публикует `*_android.apk`. Без секретов Android-шаг пропускается, а сборки для
+Windows и macOS выходят как обычно.
+
+Отладочная сборка (`npx tauri android build --apk --debug`), если ГУ по USB не найдено,
+подключается к `127.0.0.1:5555` — так протокол проверяется на эмуляторе после `adb tcpip 5555`.
 
 ## Makefile
 

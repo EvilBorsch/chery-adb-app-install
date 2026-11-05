@@ -1,17 +1,27 @@
 use serde::Serialize;
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs,
-    io::{self, Cursor, Read},
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use thiserror::Error;
 use zip::ZipArchive;
 
 mod install_diagnostics;
 mod install_wait;
+
+// Транспорт до ГУ: на компьютере — вшитый adb, на телефоне — ADB по USB через OTG.
+// Вся логика установки и выдачи прав ниже общая для всех платформ.
+#[cfg(desktop)]
+#[path = "transport_desktop.rs"]
+mod transport;
+#[cfg(target_os = "android")]
+#[path = "transport_android.rs"]
+mod transport;
+
+use transport::AdbTarget;
 
 use install_diagnostics::{failure_summary, helper_package, helper_succeeded};
 use install_wait::wait_for_installation;
@@ -42,18 +52,8 @@ const AXML_FILE: usize = 0x0003;
 const AXML_STRING_POOL: usize = 0x0001;
 const AXML_START_ELEMENT: usize = 0x0102;
 
-// adb вшит в бинарь: приложение должно работать сразу, без скачивания platform-tools.
-// Версия входит в путь распаковки, чтобы обновление приложения не оставляло старый adb.
-const ADB_VERSION: &str = "37.0.1";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const INSTALL_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-#[cfg(target_os = "macos")]
-const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-macos.zip");
-#[cfg(target_os = "windows")]
-const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-windows.zip");
-#[cfg(target_os = "linux")]
-const ADB_BUNDLE: &[u8] = include_bytes!("../binaries/adb-linux.zip");
 
 #[derive(Clone, Serialize)]
 struct Step {
@@ -68,20 +68,15 @@ struct DeviceInfo {
     serial: Option<String>,
     model: Option<String>,
     android: Option<String>,
+    /// Почему ГУ не найдено — на телефоне есть что подсказать (OTG, запрос отладки на ГУ).
+    message: Option<String>,
 }
 
-struct AdbTarget {
-    path: PathBuf,
-    serial: String,
-}
-
-#[derive(Clone, Debug)]
-struct ListedDevice {
-    serial: String,
-    state: String,
-    model: Option<String>,
-    product: Option<String>,
-    usb: bool,
+#[derive(Serialize)]
+struct PickedApk {
+    path: String,
+    name: String,
+    size: u64,
 }
 
 #[derive(Serialize)]
@@ -114,44 +109,38 @@ impl WorkLog {
     }
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(transport::plugin());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             check_device,
             install_apk,
             grant_all_permissions,
             list_uninstallable_packages,
-            uninstall_package
+            uninstall_package,
+            pick_apk_mobile
         ])
         .run(tauri::generate_context!())
         .expect("failed to run tauri app");
 }
 
-#[tauri::command]
+// Все команды работают вне главного потока: на Android вызов USB-плагина из главного потока
+// заблокировал бы его самого, а на компьютере окно не замирает, пока идёт adb.
+#[tauri::command(async)]
 fn check_device(app: AppHandle) -> Result<DeviceInfo> {
-    let adb_path = ensure_adb(&app)?;
-    match resolve_head_unit(&adb_path) {
-        Ok(adb) => {
-            let model = adb_shell_prop(&adb, "ro.product.model").ok();
-            let android = adb_shell_prop(&adb, "ro.build.version.release").ok();
-            Ok(DeviceInfo {
-                connected: true,
-                adb_path: Some(adb.path.display().to_string()),
-                serial: Some(adb.serial),
-                model,
-                android,
-            })
-        }
-        Err(_) => Ok(DeviceInfo {
-            connected: false,
-            adb_path: Some(adb_path.display().to_string()),
-            serial: None,
-            model: None,
-            android: None,
-        }),
-    }
+    transport::check_device(&app)
+}
+
+/// Выбор APK в памяти телефона. На компьютере APK выбирается диалогом в интерфейсе.
+#[tauri::command(async)]
+fn pick_apk_mobile(app: AppHandle) -> Result<Option<PickedApk>> {
+    transport::pick_apk(&app)
 }
 
 #[tauri::command(async)]
@@ -188,8 +177,7 @@ fn install_apk_inner(
         )));
     }
 
-    let adb_path = ensure_adb(app)?;
-    let adb = ensure_device(&adb_path)?;
+    let adb = transport::connect(app)?;
     if car_management {
         apply_vehicle_preinstall(&adb, log);
     }
@@ -199,7 +187,7 @@ fn install_apk_inner(
 
     let remote_apk = "/data/local/tmp/desaysv-install-target.apk";
     let remote_helper = "/data/local/tmp/desaysv-localinstall.apk";
-    let helper = resource_localinstall(app)?;
+    let helper = transport::localinstall_helper(app)?;
 
     log.info("Копирую APK на устройство");
     run_adb_checked(&adb, ["push", path_arg(&apk_path).as_str(), remote_apk])?;
@@ -244,10 +232,10 @@ fn install_apk_inner(
     );
     let started = Instant::now();
     let output = run_adb(&adb, ["shell", install_cmd.as_str()])?;
-    let failure = (!output.status.success() || !helper_succeeded(&output.stdout)).then(|| {
+    let failure = (!output.success || !helper_succeeded(&output.stdout)).then(|| {
         failure_summary(
             &output.stdout,
-            output.status.code(),
+            output.code,
             INSTALL_TIMEOUT.as_secs(),
         )
     });
@@ -317,7 +305,7 @@ fn install_apk_inner(
     Ok(package_name)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn grant_all_permissions(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
     if !is_safe_package_name(&package_name) {
         return Err(InstallerError::Message(format!(
@@ -325,8 +313,7 @@ fn grant_all_permissions(app: AppHandle, package_name: String) -> Result<Vec<Ste
         )));
     }
 
-    let adb_path = ensure_adb(&app)?;
-    let adb = ensure_device(&adb_path)?;
+    let adb = transport::connect(&app)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
             "Пакет не установлен: {package_name}"
@@ -338,10 +325,9 @@ fn grant_all_permissions(app: AppHandle, package_name: String) -> Result<Vec<Ste
     Ok(log.steps)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_uninstallable_packages(app: AppHandle) -> Result<Vec<String>> {
-    let adb_path = ensure_adb(&app)?;
-    let adb = ensure_device(&adb_path)?;
+    let adb = transport::connect(&app)?;
 
     let output = run_adb_checked(&adb, ["shell", "pm", "list", "packages", "-3"])?;
     let mut packages: Vec<String> = output
@@ -354,7 +340,7 @@ fn list_uninstallable_packages(app: AppHandle) -> Result<Vec<String>> {
     Ok(packages)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> {
     if !is_safe_package_name(&package_name) {
         return Err(InstallerError::Message(format!(
@@ -362,8 +348,7 @@ fn uninstall_package(app: AppHandle, package_name: String) -> Result<Vec<Step>> 
         )));
     }
 
-    let adb_path = ensure_adb(&app)?;
-    let adb = ensure_device(&adb_path)?;
+    let adb = transport::connect(&app)?;
     if !is_package_installed(&adb, &package_name)? {
         return Err(InstallerError::Message(format!(
             "Package is not installed: {package_name}"
@@ -392,7 +377,7 @@ fn grant_manifest_permissions(
             adb,
             ["shell", "pm", "grant", package_name, permission.as_str()],
         )?;
-        if output.status.success() {
+        if output.success {
             log.info(format!("permission: {permission}"));
         }
     }
@@ -405,7 +390,7 @@ fn grant_manifest_permissions(
 fn set_appops(adb: &AdbTarget, package_name: &str, ops: &[&str], log: &mut WorkLog) -> Result<()> {
     for &op in ops {
         let output = run_adb(adb, ["shell", "appops", "set", package_name, op, "allow"])?;
-        if output.status.success() {
+        if output.success {
             log.info(format!("appop: {op}=allow"));
         }
     }
@@ -528,7 +513,7 @@ fn grant_all_permissions_inner(
             "ignore",
         ],
     )?;
-    if auto_revoke.status.success() {
+    if auto_revoke.success {
         log.info("Авто-отзыв неиспользуемых прав отключён");
     }
 
@@ -654,12 +639,12 @@ fn notification_listener_candidates(adb: &AdbTarget, package_name: &str) -> Resu
             package_name,
         ],
     )?;
-    if query.status.success() {
+    if query.success {
         extract_component_candidates(package_name, &query.stdout, &mut candidates);
     }
 
     let dump = run_adb(adb, ["shell", "dumpsys", "package", package_name])?;
-    if dump.status.success() {
+    if dump.success {
         extract_notification_listener_candidates(package_name, &dump.stdout, &mut candidates);
     }
 
@@ -702,7 +687,7 @@ fn apply_device_owner_inner(adb: &AdbTarget, package_name: &str, log: &mut WorkL
         )?;
         append_output(log, output);
         let verify = run_adb(adb, ["shell", "dpm", "get-device-owner"])?;
-        if verify.status.success() && verify.stdout.contains(package_name) {
+        if verify.success && verify.stdout.contains(package_name) {
             log.info(format!("Device Owner enabled: {component}"));
             return Ok(());
         }
@@ -729,12 +714,12 @@ fn device_admin_candidates(adb: &AdbTarget, package_name: &str) -> Result<Vec<St
             package_name,
         ],
     )?;
-    if query.status.success() {
+    if query.success {
         extract_component_candidates(package_name, &query.stdout, &mut candidates);
     }
 
     let dump = run_adb(adb, ["shell", "dumpsys", "package", package_name])?;
-    if dump.status.success() {
+    if dump.success {
         extract_device_admin_candidates(package_name, &dump.stdout, &mut candidates);
     }
 
@@ -826,189 +811,12 @@ fn requested_permissions(adb: &AdbTarget, package_name: &str) -> Result<Vec<Stri
     Ok(permissions)
 }
 
-/// Кладёт вшитый adb на диск: запустить его из константы нельзя, а на Windows рядом с adb.exe
-/// должны лежать его DLL, поэтому распаковываем весь архив в app data dir.
-fn ensure_adb(app: &AppHandle) -> Result<PathBuf> {
-    let base = app_data_dir(app)?;
-    let tools_dir = base.join("adb").join(ADB_VERSION);
-    let adb_path = tools_dir.join(adb_exe_name());
-    if adb_path.is_file() {
-        return Ok(adb_path);
-    }
-
-    // Версии до 1.2 качали platform-tools целиком, чистим за ними ~50 МБ.
-    let downloaded_tools = base.join("android-platform-tools");
-    if downloaded_tools.exists() {
-        fs::remove_dir_all(&downloaded_tools)?;
-    }
-
-    // Распаковываем в отдельный каталог и переносим целиком: прерванная распаковка не должна
-    // оставить нерабочий adb, который на следующем запуске сочтут готовым.
-    let staging = base.join("adb").join(format!("{ADB_VERSION}.unpacking"));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
-    ZipArchive::new(Cursor::new(ADB_BUNDLE))?.extract(&staging)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let staged_adb = staging.join(adb_exe_name());
-        let mut permissions = fs::metadata(&staged_adb)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staged_adb, permissions)?;
-    }
-
-    if tools_dir.exists() {
-        fs::remove_dir_all(&tools_dir)?;
-    }
-    fs::rename(&staging, &tools_dir)?;
-
-    Ok(adb_path)
-}
-
-fn ensure_device(adb_path: &Path) -> Result<AdbTarget> {
-    resolve_head_unit(adb_path)
-}
-
-fn resolve_head_unit(adb_path: &Path) -> Result<AdbTarget> {
-    let devices = list_adb_devices(adb_path)?;
-    let online: Vec<&ListedDevice> = devices
-        .iter()
-        .filter(|device| device.state == "device")
-        .collect();
-
-    if online.is_empty() {
-        return Err(InstallerError::Message(
-            "ADB-устройство не подключено или не авторизовано".to_string(),
-        ));
-    }
-
-    let selected = select_head_unit(&online).ok_or_else(|| {
-        InstallerError::Message("ГУ не найдено среди подключенных ADB-устройств".to_string())
-    })?;
-
-    Ok(AdbTarget {
-        path: adb_path.to_path_buf(),
-        serial: selected.serial.clone(),
-    })
-}
-
-fn list_adb_devices(adb_path: &Path) -> Result<Vec<ListedDevice>> {
-    let output = run_output(adb_path, ["devices", "-l"])?;
-    if !output.status.success() {
-        return Err(InstallerError::Message(format!(
-            "Не удалось получить список ADB-устройств: {}{}",
-            output.stdout, output.stderr
-        )));
-    }
-
-    let mut devices = Vec::new();
-    for line in output.stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("List of devices") {
-            continue;
-        }
-
-        let mut parts = line.split_whitespace();
-        let Some(serial) = parts.next() else {
-            continue;
-        };
-        let Some(state) = parts.next() else {
-            continue;
-        };
-
-        let mut model = None;
-        let mut product = None;
-        let mut usb = false;
-        for part in parts {
-            if let Some(value) = part.strip_prefix("model:") {
-                model = Some(value.replace('_', " "));
-            } else if let Some(value) = part.strip_prefix("product:") {
-                product = Some(value.to_string());
-            } else if part.starts_with("usb:") {
-                usb = true;
-            }
-        }
-
-        // USB serials are hex ids like bd6bf956; network targets look like host:port.
-        if !usb && !serial.contains(':') {
-            usb = true;
-        }
-
-        devices.push(ListedDevice {
-            serial: serial.to_string(),
-            state: state.to_string(),
-            model,
-            product,
-            usb,
-        });
-    }
-
-    Ok(devices)
-}
-
-fn select_head_unit<'a>(devices: &[&'a ListedDevice]) -> Option<&'a ListedDevice> {
-    // Prefer DesaySV / Chery head units over leftover network/watch ADB sessions.
-    devices
-        .iter()
-        .copied()
-        .filter(|device| device.usb || is_truncated_hex_serial(&device.serial))
-        .max_by_key(|device| head_unit_score(device))
-        .or_else(|| {
-            devices
-                .iter()
-                .copied()
-                .filter(|device| is_truncated_hex_serial(&device.serial))
-                .max_by_key(|device| head_unit_score(device))
-        })
-        .or_else(|| {
-            devices
-                .iter()
-                .copied()
-                .max_by_key(|device| head_unit_score(device))
-        })
-}
-
-fn head_unit_score(device: &ListedDevice) -> i32 {
-    let mut score = 0;
-    let model = device.model.as_deref().unwrap_or("").to_ascii_lowercase();
-    let product = device.product.as_deref().unwrap_or("").to_ascii_lowercase();
-
-    if model.contains("desaysv") || product.contains("desay") {
-        score += 100;
-    }
-    if product.contains("g7ph") || product.contains("t22") {
-        score += 40;
-    }
-    if device.usb {
-        score += 30;
-    }
-    if is_truncated_hex_serial(&device.serial) {
-        score += 20;
-    }
-    if device.serial.contains(':') {
-        score -= 50;
-    }
-    score
-}
-
-fn is_truncated_hex_serial(serial: &str) -> bool {
-    let len = serial.len();
-    (6..=16).contains(&len)
-        && !serial.contains(':')
-        && serial.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn run_adb<I, S>(adb: &AdbTarget, args: I) -> Result<CommandOutput>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut full_args: Vec<OsString> = vec!["-s".into(), adb.serial.as_str().into()];
-    full_args.extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
-    run_output(&adb.path, full_args)
+    transport::run_adb(adb, args)
 }
 
 fn run_adb_checked<I, S>(adb: &AdbTarget, args: I) -> Result<CommandOutput>
@@ -1017,7 +825,7 @@ where
     S: AsRef<OsStr>,
 {
     let output = run_adb(adb, args)?;
-    if output.status.success() {
+    if output.success {
         Ok(output)
     } else {
         Err(InstallerError::Message(format!(
@@ -1033,7 +841,7 @@ where
     S: AsRef<OsStr>,
 {
     match run_adb(adb, args) {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.success => {}
         Ok(output) => log.warn(format!(
             "Необязательная команда завершилась с ошибкой: {}\n{}",
             output.command, output.stderr
@@ -1242,70 +1050,18 @@ fn le_u32(data: &[u8], offset: usize) -> usize {
     ]) as usize
 }
 
-fn resource_localinstall(app: &AppHandle) -> Result<PathBuf> {
-    app.path()
-        .resolve(
-            "resources/localinstall.apk",
-            tauri::path::BaseDirectory::Resource,
-        )
-        .map_err(|err| InstallerError::Message(format!("Не найден localinstall.apk: {err}")))
-}
-
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf> {
-    app.path()
-        .app_data_dir()
-        .map_err(|err| InstallerError::Message(format!("Не удалось получить app data dir: {err}")))
-}
-
-fn adb_exe_name() -> &'static str {
-    if cfg!(windows) {
-        "adb.exe"
-    } else {
-        "adb"
-    }
-}
-
-fn adb_shell_prop(adb: &AdbTarget, prop: &str) -> Result<String> {
+pub(crate) fn adb_shell_prop(adb: &AdbTarget, prop: &str) -> Result<String> {
     let output = run_adb_checked(adb, ["shell", "getprop", prop])?;
     Ok(output.stdout.trim().to_string())
 }
 
+/// Результат команды adb: на компьютере — процесса, на телефоне — сервиса ADB по USB.
 struct CommandOutput {
-    status: std::process::ExitStatus,
+    success: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
     command: String,
-}
-
-fn run_output<I, S>(program: &Path, args: I) -> Result<CommandOutput>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let args: Vec<OsString> = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_os_string())
-        .collect();
-    let command = format!(
-        "{} {}",
-        program.display(),
-        args.iter()
-            .map(|arg| arg.to_string_lossy())
-            .map(|arg| arg.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let output = Command::new(program)
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()?;
-
-    Ok(CommandOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        command,
-    })
 }
 
 fn append_output(log: &mut WorkLog, output: CommandOutput) {
@@ -1319,26 +1075,4 @@ fn append_output(log: &mut WorkLog, output: CommandOutput) {
 
 fn path_arg(path: &Path) -> String {
     path.display().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Вшитый архив собирается вручную из platform-tools, поэтому проверяем, что в нём лежит
-    /// ровно то, что ищет ensure_adb, включая DLL, без которых adb.exe не стартует.
-    #[test]
-    fn adb_bundle_contains_runtime_files() {
-        let archive = ZipArchive::new(Cursor::new(ADB_BUNDLE)).expect("вшитый архив adb читается");
-        let names: Vec<&str> = archive.file_names().collect();
-
-        let mut expected = vec![adb_exe_name()];
-        if cfg!(windows) {
-            expected.extend(["AdbWinApi.dll", "AdbWinUsbApi.dll"]);
-        }
-
-        for file in expected {
-            assert!(names.contains(&file), "в архиве нет {file}: {names:?}");
-        }
-    }
 }

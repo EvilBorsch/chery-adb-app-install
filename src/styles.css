@@ -316,3 +316,64 @@ h1 {
     width: 100%;
   }
 }
+
+/* Телефон: Android-версия установщика. */
+@media (max-width: 600px) {
+  .shell {
+    gap: 14px;
+    padding: 14px;
+  }
+
+  h1 {
+    font-size: 22px;
+  }
+
+  .status {
+    white-space: normal;
+  }
+
+  .notice {
+    font-size: 13px;
+    padding: 12px;
+  }
+
+  .toolbar button {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .actions button {
+    flex-basis: 100%;
+  }
+
+  .drop-zone {
+    gap: 14px;
+    min-height: 0;
+    padding: 18px;
+  }
+
+  .drop-icon {
+    flex-basis: 58px;
+    font-size: 16px;
+    height: 74px;
+  }
+
+  .drop-zone h2 {
+    font-size: 19px;
+    margin-bottom: 4px;
+  }
+
+  .log-panel {
+    min-height: 0;
+  }
+
+  #log {
+    font-size: 12px;
+    height: 220px;
+  }
+}
+
+body.mobile button,
+body.mobile .drop-zone {
+  -webkit-tap-highlight-color: transparent;
+}

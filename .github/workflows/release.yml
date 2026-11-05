@@ -56,11 +56,153 @@ jobs:
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: ${{ inputs.tag || github.ref_name }}
           releaseBody: |
-            Установщик APK для Tenet T8 / Chery DesaySV.
+            Программа ставит приложения (Tenet Launcher, навигаторы, Wi-Fi manager, Рустор, VPN
+            и любые другие APK) на головное устройство (ГУ) Tenet T8 / Chery DesaySV и сразу
+            выдаёт им все права: файлы, работа в фоне, поверх окон, геолокация, VPN без
+            подтверждения и т.д. Ставить можно с компьютера или прямо с Android-телефона.
 
-            Windows: `*-setup.exe` (или `*.msi`)
-            macOS Apple Silicon: `*_aarch64.dmg`
-            macOS Intel: `*_x64.dmg`
+            ## Какой файл скачать
+
+            Файлы лежат ниже, в разделе **Assets**. Нужен только один — под ваше устройство:
+
+            | Чем будете ставить | Какой файл скачать |
+            |---|---|
+            | Android-телефон | файл, который заканчивается на `_android.apk` |
+            | Компьютер с Windows | файл, который заканчивается на `-setup.exe` |
+            | Mac на процессоре Apple (M1, M2, M3, M4) | файл, который заканчивается на `_aarch64.dmg` |
+            | Mac на процессоре Intel | файл, который заканчивается на `_x64.dmg` |
+
+            Остальные файлы (`.msi`, `.tar.gz`, `Source code`) обычным пользователям не нужны.
+
+            ## Как поставить лаунчер с телефона
+
+            **Что понадобится:**
+            - Android-телефон (Android 8 или новее);
+            - тот же кабель **USB A — USB A**, которым ГУ подключают к компьютеру;
+            - переходник **OTG: USB-A (мама) → USB-C (папа)** — продаётся в любом магазине электроники.
+
+            Обычный кабель от зарядки «USB-C — USB-A» **не подойдёт**: с ним телефон думает, что
+            его подключили к компьютеру, и с ГУ не работает. Нужен именно переходник OTG.
+
+            **Шаги:**
+            1. Скачайте на телефон файл `_android.apk` из этого релиза и откройте его. Если Android
+               спросит «Разрешить установку из этого источника?» — разрешите и нажмите «Установить».
+            2. Скачайте на телефон APK лаунчера (или любого другого приложения, которое хотите
+               поставить в машину).
+            3. Подготовьте ГУ так же, как для установки с компьютера.
+            4. Соедините: ГУ → кабель USB A–A → переходник OTG → телефон.
+            5. Откройте на телефоне **DesaySV APK Installer**. Android спросит, разрешить ли
+               приложению доступ к USB-устройству: поставьте галочку «Всегда» и нажмите «ОК».
+            6. При первом подключении на экране ГУ появится «Разрешить отладку по USB?».
+               Отметьте «Всегда разрешать с этого компьютера» и нажмите «Разрешить».
+            7. Нажмите **«Проверить ГУ»**. Вверху должно появиться зелёное **«ГУ подключено»**.
+            8. Нажмите **«Выбрать APK»** и выберите файл лаунчера.
+            9. Нажмите **«Установить приложение и выдать все права»** и дождитесь в журнале
+               строки **«Готово: …»**. Большой лаунчер (около 600 МБ) копируется несколько минут —
+               не отключайте кабель и не гасите экран телефона.
+
+            Если приложение уже стоит, а прав ему не хватает: «Обновить список» → выберите
+            приложение → «Выдать все права».
+
+            Кнопку «Установить приложение с правом управления авто» нажимать не нужно, если вы
+            точно не знаете, зачем она вам.
+
+            ## Как поставить с компьютера
+
+            1. Скачайте и установите файл для своего компьютера (см. таблицу выше).
+            2. Подключите ГУ к компьютеру кабелем USB A–A.
+            3. Откройте **DesaySV APK Installer** → «Проверить ГУ» → перетащите APK в окно
+               (или «Выбрать APK») → «Установить приложение и выдать все права».
+
+            На Windows для ГУ может понадобиться USB-драйвер — его ставят отдельно.
+
+            ## Если не получается
+
+            - **«ГУ не найдено»** на телефоне — проверьте, что используется переходник OTG, а не
+              кабель от зарядки, и что кабель вставлен до конца. Отключите и подключите заново.
+            - **«Нет доступа к USB-устройству»** — вы нажали «Отмена» в окне Android. Переподключите
+              кабель и разрешите доступ.
+            - **«Не удалось подключиться к ГУ»** — посмотрите на экран ГУ: там ждёт запрос отладки
+              по USB. Разрешите его и снова нажмите «Проверить ГУ».
+            - Ошибка установки — весь журнал можно скопировать и отправить разработчику: в нём
+              есть причина от Android.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Android-сборка идёт после desktop и отдельно от них: её сбой не мешает выпуску
+  # Windows/macOS, а загрузка в уже созданный релиз не гоняется с tauri-action.
+  android:
+    needs: release
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+
+    steps:
+      # Обновления APK ставятся поверх только с той же подписью, поэтому без постоянного
+      # ключа APK не собираем вовсе.
+      - name: Check signing secrets
+        if: env.HAS_KEYSTORE != 'true'
+        run: echo "::warning::Android APK не собран — задайте секреты ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD и ANDROID_KEY_ALIAS"
+
+      - uses: actions/checkout@v4
+        if: env.HAS_KEYSTORE == 'true'
+
+      - uses: actions/setup-node@v4
+        if: env.HAS_KEYSTORE == 'true'
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        if: env.HAS_KEYSTORE == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.HAS_KEYSTORE == 'true'
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: Swatinem/rust-cache@v2
+        if: env.HAS_KEYSTORE == 'true'
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install npm dependencies
+        if: env.HAS_KEYSTORE == 'true'
+        run: npm install
+
+      - name: Set up signing
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "password=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+          } > src-tauri/gen/android/keystore.properties
+
+      - name: Build APK
+        if: env.HAS_KEYSTORE == 'true'
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          npx tauri android build --apk --target aarch64 --target armv7 --ci
+
+      - name: Upload APK to release
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          apk="DesaySV-APK-Installer_${TAG#v}_android.apk"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$apk"
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes ""
+          gh release upload "$TAG" "$apk" --clobber
